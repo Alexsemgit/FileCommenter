@@ -1,18 +1,159 @@
 # 🏷️ FileCommenter
 
-> **Всплывающие заметки к файлам и мгновенный полнотекстовый поиск в Проводнике Windows (NTFS Alternate Data Streams)**
+> **Native file notes in Windows Explorer infotips & instant full-text search engine (NTFS Alternate Data Streams)**
 > 
-> *File notes in Explorer infotips & instant full-text search engine for Windows 10 & 11.*
+> *Всплывающие заметки к файлам и мгновенный полнотекстовый поиск в Проводнике Windows 10 & 11.*
 
-[![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-0078D6?logo=windows)](https://github.com)
-[![Architecture](https://img.shields.io/badge/Architecture-x64-blue)]()
-[![C++](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=c%2B%2B)](https://en.cppreference.com/w/cpp/17)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Installer](https://img.shields.io/badge/Installer-Single--File%20(setup__comment.exe)-brightgreen)]()
+[![Platform](https://shields.io)](https://github.com)
+[![Architecture](https://shields.io)]()
+[![C++](https://shields.io)](https://cppreference.com)
+[![License](https://shields.io)](LICENSE)
+[![Installer](https://shields.io)]()
 
 ---
 
-## 🌟 Основные возможности / Features
+## 🌟 Features
+
+* **💬 Native Infotips for FILES and FOLDERS:**  
+  Hover your mouse cursor over any file or **folder** — Windows Explorer will display your custom note directly in the tooltip window via a COM In-Process Shell Extension (`IQueryInfo`).
+* **📁 Full Folder (Directory) Comment Support:**  
+  Folders in the NTFS file system fully support alternate data streams (`Folder:comment`). By utilizing the `FILE_FLAG_BACKUP_SEMANTICS` flag, the application allows reading, saving, and editing directory notes just as easily as regular files. The "Browse..." button supports selecting both individual files and entire folders.
+* **⚡ Instant Full-Text Search (NTFS Search Engine):**  
+  * Search notes across both files and folders.
+  * Search by individual words or exact phrases.
+  * Trigger scans using the "Find" button or by pressing **Enter**.
+  * Case-insensitive support for Cyrillic and Latin characters via Win32 `CharLowerBuffW`.
+  * Multi-line tooltip showing the complete note text when hovering over search results.
+  * **Double-click** or right-click &rarr; **"Open file location"** opens Explorer and highlights the found file or folder (`explorer.exe /select,"<path>"`).
+* **🖱️ Explorer Context Menu integration:**  
+  * **"Comment..."** item for files (`*`), folders (`Directory`, `Folder`), and drives (`Drive`).
+  * **"Search in notes..."** item for folders, drives, and empty directory backgrounds (`Background`).
+  * Multilingual `MUIVerb` — menu items automatically adapt to English or Russian based on system language settings!
+* **📦 1-Click Installer (`setup_comment.exe`):**  
+  * Single standalone executable with zero external dependencies.
+  * Suggests default folder (`C:\Program Files\FileCommenter` / `%LOCALAPPDATA%`).
+  * "Browse..." button to select any custom installation path.
+  * Optional toggles: context menu integration, DLL registration, Desktop/Start Menu shortcuts, and startup launch.
+  * Registers in Windows Add/Remove Programs for seamless uninstallation.
+* **🌐 Multilingual UI (EN / RU):**  
+  Automatic Windows language detection with a 1-click manual switch shortcut.
+* **⌨️ Global Hotkeys & System Tray Agent:**  
+  Customizable shortcut (default: `Win + Shift + C`) to instantly call the search interface or editor from any active application.
+
+---
+
+## 💾 How It Works: NTFS Alternate Data Streams Technology
+
+FileCommenter stores notes inside the **NTFS Alternate Data Stream** (`filename.ext:comment`):
+1. **Original File Remains Intact:** The checksum (MD5/SHA256) and size of the primary file remain completely unchanged. No bytes of the original file are ever modified.
+2. **No External Databases:** The note is permanently bound to the file itself. Renaming the file or moving it across folders on the same or any other NTFS drive preserves the attached note.
+3. **Safety & Fallbacks:** If the file is copied to FAT32/exFAT partitions or transmitted over a network that drops streams, the primary file remains completely untouched in its pristine form.
+
+---
+
+## 📥 Quick Start / Installation
+
+### Option 1. Standalone Installer (Recommended)
+1. Download **`setup_comment.exe`**.
+2. Run the executable.
+3. Modify the installation path via "Browse..." if necessary and click **"Install"**.
+4. Done! All components are automatically registered in the system.
+
+### Option 2. Portable Mode
+1. Extract `FileCommentEditor.exe`, `FileCommentTip.dll`, and `app_icon.ico` to a preferred directory.
+2. Run `install.bat` as Administrator.
+
+---
+
+## 🛠️ Building from Source
+
+The project has zero external dependencies, relying entirely on pure Win32 API and C++17.
+
+### Building via Microsoft Visual Studio (MSVC)
+1. Open the **Developer Command Prompt for Visual Studio** (x64 Native Tools).
+2. Navigate to the project directory and run:
+   ```cmd
+   build_msvc.bat
+   ```
+The script compiles:
+* `setup_comment.exe` — All-in-one standalone graphical installer with embedded resources.
+* `FileCommentEditor.exe` — Graphical editor, search engine, and system tray agent.
+* `FileCommentTip.dll` — 64-bit COM In-Process Explorer tooltip shell extension.
+* `TestHarness.exe` — Console environment for debugging the `IQueryInfo` interface.
+
+### Building via MinGW-w64 (GCC)
+If you have the GCC compiler for Windows (`g++.exe`) installed, run:
+```cmd
+build_mingw.bat
+```
+
+---
+
+## 🖥️ Command Line Interface (CLI) Usage
+
+```cmd
+:: Full-text search for notes within a directory and its subdirectories
+FileCommentEditor.exe --search "contract" --dir "C:\Work" --recursive
+
+:: Open the search GUI targeted at a specific directory
+FileCommentEditor.exe --search-gui "C:\Projects"
+
+:: Read a file comment
+FileCommentEditor.exe "C:\Docs\report.docx" --get
+
+:: Set or update a file comment
+FileCommentEditor.exe "C:\Docs\report.docx" --set "Final version, approved by Director"
+
+:: Remove a comment
+FileCommentEditor.exe "C:\Docs\report.docx" --remove
+
+:: Launch the system tray agent
+FileCommentEditor.exe --tray
+```
+
+---
+
+## 🗑️ Uninstall
+
+* Via standard Windows panel: **Settings &rarr; Apps &rarr; Installed Apps &rarr; FileCommenter &rarr; Uninstall**.
+* Or run the **`uninstall.bat`** file as Administrator.
+
+---
+
+## 📁 GitHub Repository Structure
+
+Используйте код с осторожностью.
+FileCommenter/
+├── .github/
+│   └── workflows/
+│       └── build.yml           # CI/CD automated build for GitHub Actions (MSVC x64)
+├── .gitignore                  # Excludes compiler and IDE temporary files
+├── LICENSE                     # MIT License
+├── README.md                   # Project documentation
+├── CONTRIBUTING.md             # Contribution guidelines
+├── app_icon.ico                # Vector brand application icon
+├── resource.rc                 # Editor resources (icon + EN/RU MUIVerb strings)
+├── setup_resource.rc           # Installer resources (embedded components)
+├── FileCommentEditor.cpp       # Source code for GUI editor, search, and tray agent
+├── FileCommentTip.cpp          # COM In-Process Shell Extension (IQueryInfo)
+├── FileCommentTip.def          # COM DLL exports (DllGetClassObject, DllRegisterServer)
+├── setup_comment.cpp           # Source code for the standalone graphical installer
+├── TestHarness.cpp             # DLL test harness bench for debugging
+├── build_msvc.bat              # Build script for Visual Studio 2019/2022
+├── build_mingw.bat             # Build script for MinGW GCC
+├── install.bat                 # Manual Windows component registration script
+└── uninstall.bat               # Deregistration and cleanup script
+
+---
+
+## 📄 License
+
+This project is licensed under the [MIT License](LICENSE). Free for both personal and commercial use.
+
+---
+---
+
+## 🌟 Основные возможности (Russian version)
 
 * **💬 Нативные всплывающие подсказки (Infotips) для ФАЙЛОВ и ПАПОК:**  
   Наведите курсор мыши на любой файл или **папку** — Windows Explorer покажет текст вашей заметки прямо во всплывающем окне (COM In-Process Shell Extension `IQueryInfo`).
@@ -45,7 +186,7 @@
 ## 💾 Как это работает: Технология NTFS Alternate Data Streams
 
 FileCommenter сохраняет заметки в **альтернативный поток данных NTFS** (`filename.ext:comment`):
-1. **Основной файл не изменяется:** Контрольная сумма (MD5/SHA256) и размер основного файла остаются строго исходными. Никакие байты исходного файла не модифицируются.
+1. **Основной файл не изменяется:** Контрольная сумма (MD5/SHA256) and размер основного файла остаются строго исходными. Никакие байты исходного файла не модифицируются.
 2. **Без внешних баз данных:** Заметка «привязана» к самому файлу. При переименовании файла или перемещении между папками на том же или любом другом NTFS-диске заметка сохраняется вместе с файлом.
 3. **Безопасность:** Если файл скопировать на FAT32/exFAT или отправить по сети без поддержки потоков, основной файл останется в первозданном виде.
 
@@ -122,7 +263,6 @@ FileCommentEditor.exe --tray
 
 ## 📁 Структура репозитория для GitHub
 
-```
 FileCommenter/
 ├── .github/
 │   └── workflows/
@@ -143,10 +283,3 @@ FileCommenter/
 ├── build_mingw.bat             # Скрипт сборки под MinGW GCC
 ├── install.bat                 # Ручная регистрация компонентов в Windows
 └── uninstall.bat               # Снятие регистрации и удаление
-```
-
----
-
-## 📄 Лицензия
-
-Проект распространяется под открытой лицензией [MIT License](LICENSE). Свободно для личного и коммерческого использования.
