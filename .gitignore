@@ -1,0 +1,63 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+*.res
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+*.exp
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+
+# Archives
+*.zip
+*.tar.gz
+*.7z
+
+# Visual Studio files
+.vs/
+*.sln.docstates
+*.user
+*.userosscache
+*.sln
+*.vcxproj*
+*.suo
+
+# VS Code
+.vscode/
+
+# Build directories
+build/
+bin/
+obj/
+out/
+Debug/
+Release/
+x64/
+x86/
+
+# Windows thumbs and temporary files
+[Tt]humbs.db
+[Ee]hthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.tmp
+*.log

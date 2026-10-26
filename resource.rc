@@ -1,0 +1,21 @@
+#include <windows.h>
+
+// Иконка приложения (ID 1 — отображается как основная иконка .exe файла в Проводнике)
+1 ICON "app_icon.ico"
+
+// Таблица строк для многоязычного MUIVerb в Проводнике Windows
+// Русский язык (0x419)
+LANGUAGE LANG_RUSSIAN, SUBLANG_DEFAULT
+STRINGTABLE
+BEGIN
+    101 "Комментировать..."
+    102 "Искать в заметках..."
+END
+
+// Английский язык (0x409)
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+STRINGTABLE
+BEGIN
+    101 "Comment..."
+    102 "Search in comments..."
+END
