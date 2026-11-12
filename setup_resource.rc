@@ -1,7 +1,11 @@
+#pragma code_page(65001)
 #include <windows.h>
 
 // Иконка установщика (ID 1)
 1 ICON "app_icon.ico"
+
+// Манифест UAC: обязательный запуск от имени администратора
+1 24 "setup.manifest"
 
 // Встроенные бинарные компоненты приложения
 1001 RCDATA "FileCommentEditor.exe"

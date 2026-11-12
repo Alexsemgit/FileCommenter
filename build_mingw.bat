@@ -15,7 +15,7 @@ if %errorlevel% neq 0 (
 
 echo.
 echo [1/3] Kompilyatsiya FileCommentTip.dll (COM DLL 64-bit)...
-g++.exe -O2 -shared -std=c++17 -municode FileCommentTip.cpp FileCommentTip.def -o FileCommentTip.dll -luuid -lshlwapi -lshell32 -lole32 -luser32 -ladvapi32 -static
+g++.exe -O2 -s -shared -std=c++17 -municode FileCommentTip.cpp FileCommentTip.def -o FileCommentTip.dll -luuid -lshlwapi -lshell32 -lole32 -luser32 -ladvapi32 -lpropsys -static
 if %errorlevel% neq 0 (
     echo [OSHIBKA] Ne udalos skompilirovat FileCommentTip.dll
     pause
@@ -24,8 +24,8 @@ if %errorlevel% neq 0 (
 
 echo.
 echo [2/3] Kompilyatsiya FileCommentEditor.exe (GUI/CLI s ikonkami i resursami)...
-windres.exe resource.rc -O coff -o resource.res
-g++.exe -O2 -mwindows -std=c++17 -municode FileCommentEditor.cpp resource.res -o FileCommentEditor.exe -lcomctl32 -lshell32 -lshlwapi -lole32 -luser32 -lgdi32 -ladvapi32 -static
+windres.exe --codepage 65001 resource.rc -O coff -o resource.res
+g++.exe -O2 -s -mwindows -std=c++17 -municode FileCommentEditor.cpp resource.res -o FileCommentEditor.exe -lcomctl32 -lshell32 -lshlwapi -lole32 -luuid -luser32 -lgdi32 -ladvapi32 -static
 if %errorlevel% neq 0 (
     echo [OSHIBKA] Ne udalos skompilirovat FileCommentEditor.exe
     del resource.res 2>nul
@@ -36,8 +36,8 @@ del resource.res 2>nul
 
 echo.
 echo [3/4] Kompilyatsiya setup_comment.exe (Avtonomnyy installer)...
-windres.exe setup_resource.rc -O coff -o setup_resource.res
-g++.exe -O2 -mwindows -std=c++17 -municode setup_comment.cpp setup_resource.res -o setup_comment.exe -lcomctl32 -lshell32 -lshlwapi -lole32 -luser32 -lgdi32 -ladvapi32 -luuid -static -static-libgcc -static-libstdc++
+windres.exe --codepage 65001 setup_resource.rc -O coff -o setup_resource.res
+g++.exe -O2 -s -mwindows -std=c++17 -municode setup_comment.cpp setup_resource.res -o setup_comment.exe -lcomctl32 -lshell32 -lshlwapi -lole32 -luser32 -lgdi32 -ladvapi32 -luuid -static -static-libgcc -static-libstdc++
 if %errorlevel% neq 0 (
     echo [OSHIBKA] Ne udalos skompilirovat setup_comment.exe
     del setup_resource.res 2>nul

@@ -148,10 +148,79 @@ static bool ReadNTFSComment(const std::wstring& filePath, std::wstring& outComme
     return !outComment.empty();
 }
 
+// Вспомогательная функция чтения InfoTip из desktop.ini (для папок в панели навигации и Быстром доступе)
+static bool ReadDesktopIniComment(const std::wstring& folderPath, std::wstring& outComment) {
+    outComment.clear();
+    std::wstring iniPath = NormalizePathForADS(folderPath) + L"\\desktop.ini";
+    DWORD dwAttr = GetFileAttributesW(iniPath.c_str());
+    if (dwAttr == INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+
+    wchar_t buf[4096] = { 0 };
+    DWORD readChars = GetPrivateProfileStringW(
+        L".ShellClassInfo",
+        L"InfoTip",
+        L"",
+        buf,
+        ARRAYSIZE(buf),
+        iniPath.c_str()
+    );
+
+    if (readChars > 0) {
+        outComment.assign(buf, readChars);
+        while (!outComment.empty() && (outComment.back() == L'\r' || outComment.back() == L'\n' || outComment.back() == L' ')) {
+            outComment.pop_back();
+        }
+        return !outComment.empty();
+    }
+    return false;
+}
+
+// Вспомогательная функция разрешения ярлыков .lnk (для секций «Недавние», «Быстрый доступ» и Рабочего стола)
+static bool ResolveShortcut(const std::wstring& lnkPath, std::wstring& outTargetPath) {
+    outTargetPath.clear();
+
+    bool bNeedUninit = false;
+    HRESULT hrInit = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (SUCCEEDED(hrInit)) {
+        bNeedUninit = true;
+    }
+
+    IShellLinkW* psl = NULL;
+    HRESULT hr = CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLinkW, (void**)&psl);
+    if (SUCCEEDED(hr)) {
+        IPersistFile* ppf = NULL;
+        hr = psl->QueryInterface(IID_IPersistFile, (void**)&ppf);
+        if (SUCCEEDED(hr)) {
+            hr = ppf->Load(lnkPath.c_str(), STGM_READ);
+            if (SUCCEEDED(hr)) {
+                // Разрешаем ярлык без UI и без поиска по сети
+                psl->Resolve(NULL, SLR_NO_UI | SLR_NOSEARCH | SLR_NOTRACK | SLR_NOLINKINFO);
+
+                wchar_t szTarget[MAX_PATH] = { 0 };
+                WIN32_FIND_DATAW wfd = { 0 };
+                hr = psl->GetPath(szTarget, MAX_PATH, &wfd, SLGP_RAWPATH);
+                if (SUCCEEDED(hr) && wcslen(szTarget) > 0) {
+                    outTargetPath = szTarget;
+                }
+            }
+            ppf->Release();
+        }
+        psl->Release();
+    }
+
+    if (bNeedUninit) {
+        CoUninitialize();
+    }
+
+    return !outTargetPath.empty();
+}
+
 // ============================================================================
-// Класс CFileCommentTip: реализует IQueryInfo и IPersistFile
+// Класс CFileCommentTip: реализует IQueryInfo, IPersistFile и IShellExtInit
 // ============================================================================
-class CFileCommentTip : public IQueryInfo, public IPersistFile {
+class CFileCommentTip : public IQueryInfo, public IPersistFile, public IShellExtInit {
 private:
     LONG m_cRef;
     std::wstring m_filePath;
@@ -178,6 +247,8 @@ public:
             *ppv = static_cast<IPersistFile*>(this);
         } else if (IsEqualIID(riid, IID_IPersist)) {
             *ppv = static_cast<IPersist*>(this);
+        } else if (IsEqualIID(riid, IID_IShellExtInit)) {
+            *ppv = static_cast<IShellExtInit*>(this);
         } else {
             return E_NOINTERFACE;
         }
@@ -196,6 +267,49 @@ public:
             delete this;
         }
         return cRef;
+    }
+
+    // --- Методы IShellExtInit (КРИТИЧНО ДЛЯ «БЫСТРОГО ДОСТУПА», «НЕДАВНИХ» И НАВИГАЦИОННОЙ ПАНЕЛИ) ---
+    STDMETHODIMP Initialize(PCIDLIST_ABSOLUTE /*pidlFolder*/, IDataObject* pdtobj, HKEY /*hkeyProgID*/) override {
+        if (!pdtobj) return E_INVALIDARG;
+
+        // 1. Пробуем извлечь путь через CF_HDROP
+        FORMATETC fe = { CF_HDROP, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+        STGMEDIUM medium = { 0 };
+        if (SUCCEEDED(pdtobj->GetData(&fe, &medium))) {
+            HDROP hDrop = static_cast<HDROP>(GlobalLock(medium.hGlobal));
+            if (hDrop) {
+                wchar_t szPath[MAX_PATH] = { 0 };
+                if (DragQueryFileW(hDrop, 0, szPath, ARRAYSIZE(szPath)) > 0) {
+                    m_filePath = szPath;
+                }
+                GlobalUnlock(medium.hGlobal);
+            }
+            ReleaseStgMedium(&medium);
+            if (!m_filePath.empty()) return S_OK;
+        }
+
+        // 2. Если CF_HDROP нет (виртуальные представления Windows 11 Home / Quick Access),
+        // пробуем получить через IShellItemArray
+        IShellItemArray* pItemArray = NULL;
+        if (SUCCEEDED(SHCreateShellItemArrayFromDataObject(pdtobj, IID_IShellItemArray, (void**)&pItemArray))) {
+            DWORD count = 0;
+            pItemArray->GetCount(&count);
+            if (count > 0) {
+                IShellItem* pItem = NULL;
+                if (SUCCEEDED(pItemArray->GetItemAt(0, &pItem))) {
+                    LPWSTR pszPath = NULL;
+                    if (SUCCEEDED(pItem->GetDisplayName(SIGDN_FILESYSPATH, &pszPath))) {
+                        m_filePath = pszPath;
+                        CoTaskMemFree(pszPath);
+                    }
+                    pItem->Release();
+                }
+            }
+            pItemArray->Release();
+        }
+
+        return m_filePath.empty() ? E_FAIL : S_OK;
     }
 
     // --- Методы IPersistFile ---
@@ -250,35 +364,64 @@ public:
             return S_FALSE; // Передаем управление стандартному обработчику Проводника
         }
 
-        // Читаем комментарий из потока :comment
-        std::wstring commentText;
-        bool hasComment = ReadNTFSComment(m_filePath, commentText);
+        std::wstring effectivePath = m_filePath;
+        std::wstring shortcutTarget;
+        bool isShortcut = false;
 
-        // Если у файла нет нашего комментария, возвращаем S_FALSE:
-        // Проводник покажет свой родной, нетронутый тултип!
+        // В секциях «Недавние» (Recent) и «Быстрый доступ» элементы представлены ярлыками .lnk
+        // Если это файл .lnk, разрешаем его к реальному целевому объекту:
+        if (m_filePath.length() >= 4 && 
+            _wcsicmp(m_filePath.c_str() + m_filePath.length() - 4, L".lnk") == 0) {
+            if (ResolveShortcut(m_filePath, shortcutTarget)) {
+                effectivePath = shortcutTarget;
+                isShortcut = true;
+            }
+        }
+
+        // 1. Проверяем комментарий в скрытом потоке NTFS (:comment)
+        std::wstring commentText;
+        bool hasComment = ReadNTFSComment(effectivePath, commentText);
+
+        // 2. Если в потоке пусто, а объект является папкой — проверяем desktop.ini InfoTip
+        if (!hasComment || commentText.empty()) {
+            DWORD dwAttr = GetFileAttributesW(effectivePath.c_str());
+            if (dwAttr != INVALID_FILE_ATTRIBUTES && (dwAttr & FILE_ATTRIBUTE_DIRECTORY)) {
+                hasComment = ReadDesktopIniComment(effectivePath, commentText);
+            }
+        }
+
+        // Если комментария нет, возвращаем S_FALSE:
+        // Проводник покажет свой родной тултип (например, путь к файлу)
         if (!hasComment || commentText.empty()) {
             return S_FALSE;
         }
 
-        // Если комментарий есть — формируем объединенный красивый тултип:
-        // 1. Свойства файла (тип, размер, дата изменения)
-        // 2. Визуальный разделитель
-        // 3. Комментарий
+        // Формируем объединенный тултип:
         std::wstring tipResult;
 
-        // Получаем тип файла
-        SHFILEINFOW sfi = { 0 };
-        if (SHGetFileInfoW(m_filePath.c_str(), 0, &sfi, sizeof(sfi), SHGFI_TYPENAME)) {
-            if (wcslen(sfi.szTypeName) > 0) {
-                tipResult += L"Тип: ";
-                tipResult += sfi.szTypeName;
+        // Если это ярлык — указываем это и отображаем путь к цели
+        if (isShortcut) {
+            tipResult += L"Тип: Ярлык\n";
+            if (!shortcutTarget.empty()) {
+                tipResult += L"Расположение: ";
+                tipResult += shortcutTarget;
                 tipResult += L"\n";
+            }
+        } else {
+            // Тип исходного файла
+            SHFILEINFOW sfi = { 0 };
+            if (SHGetFileInfoW(effectivePath.c_str(), 0, &sfi, sizeof(sfi), SHGFI_TYPENAME)) {
+                if (wcslen(sfi.szTypeName) > 0) {
+                    tipResult += L"Тип: ";
+                    tipResult += sfi.szTypeName;
+                    tipResult += L"\n";
+                }
             }
         }
 
         // Получаем размер и дату изменения файла
         WIN32_FILE_ATTRIBUTE_DATA fad = { 0 };
-        if (GetFileAttributesExW(m_filePath.c_str(), GetFileExInfoStandard, &fad)) {
+        if (GetFileAttributesExW(effectivePath.c_str(), GetFileExInfoStandard, &fad)) {
             // Размер (только для обычных файлов, не для папок)
             if (!(fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
                 ULARGE_INTEGER uliSize;
@@ -297,10 +440,9 @@ public:
                 SYSTEMTIME st;
                 if (FileTimeToSystemTime(&ftLocal, &st)) {
                     wchar_t szDate[64];
-                    StringCchPrintfW(szDate, ARRAYSIZE(szDate), L"Изменен: %02d.%02d.%04d %02d:%02d",
+                    StringCchPrintfW(szDate, ARRAYSIZE(szDate), L"Изменен: %02d.%02d.%04d %02d:%02d\n",
                         st.wDay, st.wMonth, st.wYear, st.wHour, st.wMinute);
                     tipResult += szDate;
-                    tipResult += L"\n";
                 }
             }
         }
@@ -482,6 +624,21 @@ STDAPI DllRegisterServer(void) {
         SetRegistryValue(root, 
             L"Software\\Classes\\Folder\\shellex\\{00021500-0000-0000-C000-000000000046}", 
             NULL, CLSID_STRING);
+
+        // Регистрация для дисков (Drive: C:, D:, E: и т.д.)
+        SetRegistryValue(root, 
+            L"Software\\Classes\\Drive\\shellex\\{00021500-0000-0000-C000-000000000046}", 
+            NULL, CLSID_STRING);
+
+        // Регистрация для всех объектов файловой системы (AllFilesystemObjects) - для плиток Быстрого доступа
+        SetRegistryValue(root, 
+            L"Software\\Classes\\AllFilesystemObjects\\shellex\\{00021500-0000-0000-C000-000000000046}", 
+            NULL, CLSID_STRING);
+
+        // Регистрация для ярлыков (.lnk / lnkfile) - КРИТИЧЕСКИ ВАЖНО ДЛЯ СЕКЦИИ «НЕДАВНИЕ» И «БЫСТРЫЙ ДОСТУП»!
+        SetRegistryValue(root, 
+            L"Software\\Classes\\lnkfile\\shellex\\{00021500-0000-0000-C000-000000000046}", 
+            NULL, CLSID_STRING);
     }
 
     // Одобрение расширения в системе (Approved Shell Extensions)
@@ -507,6 +664,9 @@ STDAPI DllUnregisterServer(void) {
         RegDeleteKeyW(root, L"Software\\Classes\\*\\shellex\\{00021500-0000-0000-C000-000000000046}");
         RegDeleteKeyW(root, L"Software\\Classes\\Directory\\shellex\\{00021500-0000-0000-C000-000000000046}");
         RegDeleteKeyW(root, L"Software\\Classes\\Folder\\shellex\\{00021500-0000-0000-C000-000000000046}");
+        RegDeleteKeyW(root, L"Software\\Classes\\Drive\\shellex\\{00021500-0000-0000-C000-000000000046}");
+        RegDeleteKeyW(root, L"Software\\Classes\\AllFilesystemObjects\\shellex\\{00021500-0000-0000-C000-000000000046}");
+        RegDeleteKeyW(root, L"Software\\Classes\\lnkfile\\shellex\\{00021500-0000-0000-C000-000000000046}");
     }
 
     // Удаляем из Approved

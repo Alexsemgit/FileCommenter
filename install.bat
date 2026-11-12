@@ -15,7 +15,12 @@ echo  Ustanovka FileCommenter v sistemu
 echo ========================================================
 
 echo.
-echo [1/2] Registratsiya Shell Extension DLL v sisteme...
+echo [1/3] Ostanovka rabotayushchikh kopiy prilozheniya...
+taskkill /f /im FileCommentEditor.exe >nul 2>&1
+taskkill /f /im TestHarness.exe >nul 2>&1
+
+echo.
+echo [2/3] Registratsiya Shell Extension DLL v sisteme...
 regsvr32.exe /s "%~dp0FileCommentTip.dll"
 if %errorlevel% equ 0 (
     echo   [OK] FileCommentTip.dll uspeshno zaregistrirovana!
@@ -24,7 +29,7 @@ if %errorlevel% equ 0 (
 )
 
 echo.
-echo [2/2] Dobavlenie punktov v kontekstnoe menyu Provodnika...
+echo [3/3] Dobavlenie punktov v kontekstnoe menyu Provodnika...
 "%~dp0FileCommentEditor.exe" --install-context
 echo   [OK] Punkty kontekstnogo menyu uspeshno zaregistrirovany:
 echo        * Lyubye fayly (*)              -^> "Kommentirovat..."
@@ -32,6 +37,8 @@ echo        * Papki (Directory, Folder)     -^> "Kommentirovat..."
 echo        * Papki (Directory, Folder)     -^> "Iskat v zametkakh..."
 echo        * Fon papki (Background)        -^> "Iskat v zametkakh..."
 echo        * Diski (C:, D:, Drive)         -^> "Iskat v zametkakh..."
+echo        * Yarlyki i "Nedavnie" (lnkfile)-^> Podskazki s zametkami celki
+echo        * Bokovaya panel i Bystryy dostup-^> Sinxronizaciya desktop.ini
 
 echo.
 echo ========================================================

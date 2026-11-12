@@ -106,9 +106,10 @@
 #define ID_TRAY_TOGGLE_LANG       3003
 #define ID_TRAY_EXIT              3004
 
-// Меню резервного копирования (JSON)
+// Меню резервного копирования и синхронизации
 #define ID_BACKUP_EXPORT          4001
 #define ID_BACKUP_IMPORT          4002
+#define ID_BACKUP_SYNC_FOLDERS    4003
 
 // Пользовательские сообщения поиска
 #define WM_SEARCH_RESULT_FOUND    (WM_USER + 101)
@@ -200,6 +201,8 @@ enum StringKey {
     STR_BACKUP_EXPORT_SUCCESS,
     STR_BACKUP_IMPORT_SUCCESS,
     STR_BACKUP_IMPORT_CONFIRM,
+    STR_MENU_BACKUP_SYNC,
+    STR_BACKUP_SYNC_SUCCESS,
     STR_KEY_COUNT
 };
 
@@ -368,7 +371,13 @@ static const wchar_t* g_dict[STR_KEY_COUNT][2] = {
       L"Restore completed!\nTotal backup entries: %u\nSuccessfully restored: %u\nSkipped/Errors: %u" },
     // STR_BACKUP_IMPORT_CONFIRM
     { L"Восстановить заметки из файла:\n%s\n\nСуществующие заметки для совпадающих файлов будут перезаписаны. Продолжить?",
-      L"Restore comments from file:\n%s\n\nExisting comments for matching files will be overwritten. Proceed?" }
+      L"Restore comments from file:\n%s\n\nExisting comments for matching files will be overwritten. Proceed?" },
+    // STR_MENU_BACKUP_SYNC
+    { L"🔄 Синхронизировать папки для Боковой панели и Быстрого доступа...",
+      L"🔄 Sync Folders for Navigation Pane & Quick Access..." },
+    // STR_BACKUP_SYNC_SUCCESS
+    { L"Синхронизация завершена!\nОбновлено папок для Проводника: %u\n\nТеперь подсказки с заметками видны в левой панели, плитках Быстрого доступа и Избранном.",
+      L"Synchronization complete!\nUpdated folders for Explorer: %u\n\nNotes are now visible in the Navigation Pane, Quick Access tiles, and Favorites." }
 };
 
 static AppLang g_currentLang = LANG_RU;
@@ -396,12 +405,49 @@ static HICON g_hAppIcon = NULL;
 static HICON g_hAppIconSmall = NULL;
 static std::wstring g_currentFilePath;
 
-// Настройки хоткея
-static UINT g_hotkeyMods = MOD_WIN | MOD_SHIFT;
-static UINT g_hotkeyVK = 'C';
+// Настройки хоткея: по умолчанию безопасный и свободный Ctrl + Shift + F
+static UINT g_hotkeyMods = MOD_CONTROL | MOD_SHIFT;
+static UINT g_hotkeyVK = 'F';
 static DWORD g_hotkeyAction = 0; // 0 = поиск, 1 = редактор
 static bool g_hotkeyRegistered = false;
 static bool g_bEnableTrayIcon = true; // Отображать ли иконку в трее
+
+// Расширенная таблица всех поддерживаемых клавиш для быстрого вызова
+struct HotkeyKeyEntry {
+    const wchar_t* label;
+    UINT vk;
+};
+
+static const HotkeyKeyEntry g_allHotkeyKeys[] = {
+    // Буквы A-Z (26 букв латиницы)
+    { L"A", 'A' }, { L"B", 'B' }, { L"C", 'C' }, { L"D", 'D' }, { L"E", 'E' },
+    { L"F", 'F' }, { L"G", 'G' }, { L"H", 'H' }, { L"I", 'I' }, { L"J", 'J' },
+    { L"K", 'K' }, { L"L", 'L' }, { L"M", 'M' }, { L"N", 'N' }, { L"O", 'O' },
+    { L"P", 'P' }, { L"Q", 'Q' }, { L"R", 'R' }, { L"S", 'S' }, { L"T", 'T' },
+    { L"U", 'U' }, { L"V", 'V' }, { L"W", 'W' }, { L"X", 'X' }, { L"Y", 'Y' }, { L"Z", 'Z' },
+    // Цифры 0-9
+    { L"0", '0' }, { L"1", '1' }, { L"2", '2' }, { L"3", '3' }, { L"4", '4' },
+    { L"5", '5' }, { L"6", '6' }, { L"7", '7' }, { L"8", '8' }, { L"9", '9' },
+    // Функциональные клавиши F1-F12
+    { L"F1", VK_F1 }, { L"F2", VK_F2 }, { L"F3", VK_F3 }, { L"F4", VK_F4 },
+    { L"F5", VK_F5 }, { L"F6", VK_F6 }, { L"F7", VK_F7 }, { L"F8", VK_F8 },
+    { L"F9", VK_F9 }, { L"F10", VK_F10 }, { L"F11", VK_F11 }, { L"F12", VK_F12 },
+    // Специальные и навигационные клавиши
+    { L"Space", VK_SPACE },
+    { L"Tab", VK_TAB },
+    { L"Enter", VK_RETURN },
+    { L"Esc", VK_ESCAPE },
+    { L"Backspace", VK_BACK },
+    { L"Delete", VK_DELETE },
+    { L"Insert", VK_INSERT },
+    { L"Home", VK_HOME },
+    { L"End", VK_END },
+    { L"PageUp", VK_PRIOR },
+    { L"PageDown", VK_NEXT },
+    { L"~ (Tilde)", VK_OEM_3 },
+    { L"- (Minus)", VK_OEM_MINUS },
+    { L"= (Plus)", VK_OEM_PLUS }
+};
 
 // ----------------------------------------------------------------------------
 // Структуры поиска
@@ -543,14 +589,17 @@ static std::wstring FormatHotkeyString(UINT mods, UINT vk) {
     if (mods & MOD_ALT) res += L"Alt + ";
     if (mods & MOD_SHIFT) res += L"Shift + ";
 
+    for (const auto& k : g_allHotkeyKeys) {
+        if (k.vk == vk) {
+            res += k.label;
+            return res;
+        }
+    }
+
     if (vk >= 'A' && vk <= 'Z') {
         res += (wchar_t)vk;
     } else if (vk >= '0' && vk <= '9') {
         res += (wchar_t)vk;
-    } else if (vk >= VK_F1 && vk <= VK_F12) {
-        res += L"F" + std::to_wstring(vk - VK_F1 + 1);
-    } else if (vk == VK_SPACE) {
-        res += L"Space";
     } else {
         wchar_t szKey[32];
         StringCchPrintfW(szKey, ARRAYSIZE(szKey), L"0x%02X", vk);
@@ -580,6 +629,12 @@ static void LoadAppSettings() {
     }
     if (RegGetDwordValue(HKEY_CURRENT_USER, L"Software\\FileCommenter", L"HotkeyAction", dwAct)) {
         g_hotkeyAction = dwAct;
+    }
+
+    // Автоматическая миграция старого конфликтующего сочетания Win + Shift + C на свободный Ctrl + Shift + F
+    if (g_hotkeyMods == (MOD_WIN | MOD_SHIFT) && g_hotkeyVK == 'C') {
+        g_hotkeyMods = MOD_CONTROL | MOD_SHIFT;
+        g_hotkeyVK = 'F';
     }
 
     // 3. Отображение иконки в системном трее
@@ -626,61 +681,193 @@ static bool ReadComment(const std::wstring& filePath, std::wstring& outComment) 
         NULL
     );
 
-    if (hFile == INVALID_HANDLE_VALUE) {
-        return false;
-    }
+    if (hFile != INVALID_HANDLE_VALUE) {
+        DWORD dwSizeHigh = 0;
+        DWORD dwSizeLow = GetFileSize(hFile, &dwSizeHigh);
+        if (dwSizeLow > 0 && dwSizeLow != INVALID_FILE_SIZE) {
+            std::vector<BYTE> buffer(dwSizeLow + 4, 0);
+            DWORD dwRead = 0;
+            ReadFile(hFile, buffer.data(), dwSizeLow, &dwRead, NULL);
+            CloseHandle(hFile);
 
-    DWORD dwSizeHigh = 0;
-    DWORD dwSizeLow = GetFileSize(hFile, &dwSizeHigh);
-    if (dwSizeLow == 0 || dwSizeLow == INVALID_FILE_SIZE) {
-        CloseHandle(hFile);
-        return false;
-    }
-
-    std::vector<BYTE> buffer(dwSizeLow + 4, 0);
-    DWORD dwRead = 0;
-    ReadFile(hFile, buffer.data(), dwSizeLow, &dwRead, NULL);
-    CloseHandle(hFile);
-
-    if (dwRead == 0) return false;
-
-    // Чтение UTF-8 с BOM (0xEF, 0xBB, 0xBF)
-    if (dwRead >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF) {
-        int wlen = MultiByteToWideChar(CP_UTF8, 0, (const char*)buffer.data() + 3, dwRead - 3, NULL, 0);
-        if (wlen > 0) {
-            outComment.resize(wlen);
-            MultiByteToWideChar(CP_UTF8, 0, (const char*)buffer.data() + 3, dwRead - 3, &outComment[0], wlen);
-        }
-    } else if (dwRead >= 2 && buffer[0] == 0xFF && buffer[1] == 0xFE) {
-        // UTF-16LE с BOM
-        int chars = (dwRead - 2) / sizeof(wchar_t);
-        outComment.assign((const wchar_t*)(buffer.data() + 2), chars);
-    } else {
-        // Пробуем как чистый UTF-8
-        int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (const char*)buffer.data(), dwRead, NULL, 0);
-        if (wlen > 0) {
-            outComment.resize(wlen);
-            MultiByteToWideChar(CP_UTF8, 0, (const char*)buffer.data(), dwRead, &outComment[0], wlen);
+            if (dwRead > 0) {
+                // Чтение UTF-8 с BOM (0xEF, 0xBB, 0xBF)
+                if (dwRead >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF) {
+                    int wlen = MultiByteToWideChar(CP_UTF8, 0, (const char*)buffer.data() + 3, dwRead - 3, NULL, 0);
+                    if (wlen > 0) {
+                        outComment.resize(wlen);
+                        MultiByteToWideChar(CP_UTF8, 0, (const char*)buffer.data() + 3, dwRead - 3, &outComment[0], wlen);
+                    }
+                } else if (dwRead >= 2 && buffer[0] == 0xFF && buffer[1] == 0xFE) {
+                    // UTF-16LE с BOM
+                    int chars = (dwRead - 2) / sizeof(wchar_t);
+                    outComment.assign((const wchar_t*)(buffer.data() + 2), chars);
+                } else {
+                    // Пробуем как чистый UTF-8
+                    int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (const char*)buffer.data(), dwRead, NULL, 0);
+                    if (wlen > 0) {
+                        outComment.resize(wlen);
+                        MultiByteToWideChar(CP_UTF8, 0, (const char*)buffer.data(), dwRead, &outComment[0], wlen);
+                    } else {
+                        // Фолбэк на ANSI / Windows-1251
+                        int wlenA = MultiByteToWideChar(CP_ACP, 0, (const char*)buffer.data(), dwRead, NULL, 0);
+                        if (wlenA > 0) {
+                            outComment.resize(wlenA);
+                            MultiByteToWideChar(CP_ACP, 0, (const char*)buffer.data(), dwRead, &outComment[0], wlenA);
+                        }
+                    }
+                }
+            }
         } else {
-            // Фолбэк на ANSI / Windows-1251
-            int wlenA = MultiByteToWideChar(CP_ACP, 0, (const char*)buffer.data(), dwRead, NULL, 0);
-            if (wlenA > 0) {
-                outComment.resize(wlenA);
-                MultiByteToWideChar(CP_ACP, 0, (const char*)buffer.data(), dwRead, &outComment[0], wlenA);
+            CloseHandle(hFile);
+        }
+    }
+
+    // Если в потоке пусто или файл не открылся, а объект является каталогом (папкой) — проверяем desktop.ini InfoTip!
+    if (outComment.empty()) {
+        DWORD dwAttr = GetFileAttributesW(filePath.c_str());
+        if (dwAttr != INVALID_FILE_ATTRIBUTES && (dwAttr & FILE_ATTRIBUTE_DIRECTORY)) {
+            std::wstring norm = NormalizePathForADS(filePath);
+            std::wstring iniPath = norm + L"\\desktop.ini";
+            wchar_t buf[4096] = { 0 };
+            DWORD readChars = GetPrivateProfileStringW(
+                L".ShellClassInfo",
+                L"InfoTip",
+                L"",
+                buf,
+                ARRAYSIZE(buf),
+                iniPath.c_str()
+            );
+            if (readChars > 0) {
+                outComment.assign(buf, readChars);
             }
         }
     }
-    return true;
+
+    // Удаляем концевые пробелы и переносы строк
+    while (!outComment.empty() && (outComment.back() == L'\r' || outComment.back() == L'\n' || outComment.back() == L' ')) {
+        outComment.pop_back();
+    }
+
+    return !outComment.empty();
+}
+
+// ----------------------------------------------------------------------------
+// Синхронизация ярлыков в системной папке «Недавние» (%APPDATA%\Microsoft\Windows\Recent)
+// ----------------------------------------------------------------------------
+// В секциях «Главная» и «Недавние» Проводника Windows элементы отображаются в виде ярлыков (.lnk).
+// Родной системный обработчик shell32.dll читает поле Description ярлыка и выводит его в тултип!
+static bool UpdateRecentShortcutDescription(const std::wstring& targetPath, const std::wstring& comment) {
+    wchar_t szRecent[MAX_PATH] = { 0 };
+    if (!SHGetSpecialFolderPathW(NULL, szRecent, CSIDL_RECENT, FALSE)) {
+        return false;
+    }
+
+    std::wstring recentPattern = std::wstring(szRecent) + L"\\*.lnk";
+    WIN32_FIND_DATAW wfd;
+    HANDLE hFind = FindFirstFileW(recentPattern.c_str(), &wfd);
+    if (hFind == INVALID_HANDLE_VALUE) return false;
+
+    std::wstring normTarget = NormalizePathForADS(targetPath);
+    bool anyUpdated = false;
+
+    IShellLinkW* psl = NULL;
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLinkW, (void**)&psl))) {
+        IPersistFile* ppf = NULL;
+        if (SUCCEEDED(psl->QueryInterface(IID_IPersistFile, (void**)&ppf))) {
+            do {
+                if (wfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                std::wstring lnkFile = std::wstring(szRecent) + L"\\" + wfd.cFileName;
+
+                if (SUCCEEDED(ppf->Load(lnkFile.c_str(), STGM_READWRITE))) {
+                    wchar_t szPath[MAX_PATH] = { 0 };
+                    WIN32_FIND_DATAW fd = { 0 };
+                    if (SUCCEEDED(psl->GetPath(szPath, ARRAYSIZE(szPath), &fd, SLGP_RAWPATH)) && wcslen(szPath) > 0) {
+                        std::wstring normCur = NormalizePathForADS(szPath);
+                        if (_wcsicmp(normCur.c_str(), normTarget.c_str()) == 0) {
+                            std::wstring desc;
+                            if (!comment.empty()) {
+                                desc = L"📝 Заметка: " + comment;
+                            }
+                            psl->SetDescription(desc.c_str());
+                            ppf->Save(lnkFile.c_str(), TRUE);
+                            anyUpdated = true;
+                        }
+                    }
+                }
+            } while (FindNextFileW(hFind, &wfd));
+            ppf->Release();
+        }
+        psl->Release();
+    }
+    FindClose(hFind);
+    return anyUpdated;
+}
+
+static void SyncAllRecentShortcuts(DWORD& outCount) {
+    outCount = 0;
+    wchar_t szRecent[MAX_PATH] = { 0 };
+    if (!SHGetSpecialFolderPathW(NULL, szRecent, CSIDL_RECENT, FALSE)) return;
+
+    std::wstring pattern = std::wstring(szRecent) + L"\\*.lnk";
+    WIN32_FIND_DATAW wfd;
+    HANDLE hFind = FindFirstFileW(pattern.c_str(), &wfd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+
+    IShellLinkW* psl = NULL;
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLinkW, (void**)&psl))) {
+        IPersistFile* ppf = NULL;
+        if (SUCCEEDED(psl->QueryInterface(IID_IPersistFile, (void**)&ppf))) {
+            do {
+                if (wfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                std::wstring lnkFile = std::wstring(szRecent) + L"\\" + wfd.cFileName;
+                if (SUCCEEDED(ppf->Load(lnkFile.c_str(), STGM_READWRITE))) {
+                    wchar_t szTarget[MAX_PATH] = { 0 };
+                    WIN32_FIND_DATAW fd = { 0 };
+                    if (SUCCEEDED(psl->GetPath(szTarget, ARRAYSIZE(szTarget), &fd, SLGP_RAWPATH)) && wcslen(szTarget) > 0) {
+                        std::wstring comment;
+                        if (ReadComment(szTarget, comment) && !comment.empty()) {
+                            std::wstring desc = L"📝 Заметка: " + comment;
+                            psl->SetDescription(desc.c_str());
+                            ppf->Save(lnkFile.c_str(), TRUE);
+                            outCount++;
+                        }
+                    }
+                }
+            } while (FindNextFileW(hFind, &wfd));
+            ppf->Release();
+        }
+        psl->Release();
+    }
+    FindClose(hFind);
 }
 
 static bool WriteComment(const std::wstring& filePath, const std::wstring& comment) {
     std::wstring adsPath = NormalizePathForADS(filePath) + L":comment";
+    DWORD dwAttr = GetFileAttributesW(filePath.c_str());
+    bool isDir = (dwAttr != INVALID_FILE_ATTRIBUTES && (dwAttr & FILE_ATTRIBUTE_DIRECTORY));
 
     if (comment.empty()) {
         DeleteFileW(adsPath.c_str());
+
+        // Если это папка — также очищаем InfoTip в desktop.ini
+        if (isDir) {
+            std::wstring norm = NormalizePathForADS(filePath);
+            std::wstring iniPath = norm + L"\\desktop.ini";
+            DWORD iniAttrs = GetFileAttributesW(iniPath.c_str());
+            if (iniAttrs != INVALID_FILE_ATTRIBUTES) {
+                SetFileAttributesW(iniPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+                WritePrivateProfileStringW(L".ShellClassInfo", L"InfoTip", NULL, iniPath.c_str());
+                WritePrivateProfileStringW(L"SummaryInformation", L"Comment", NULL, iniPath.c_str());
+                SetFileAttributesW(iniPath.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+            }
+            SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, norm.c_str(), NULL);
+        }
+        UpdateRecentShortcutDescription(filePath, L"");
         return true;
     }
 
+    // 1. Запись в альтернативный поток NTFS :comment (файлы и папки)
     HANDLE hFile = CreateFileW(
         adsPath.c_str(),
         GENERIC_WRITE,
@@ -691,29 +878,79 @@ static bool WriteComment(const std::wstring& filePath, const std::wstring& comme
         NULL
     );
 
-    if (hFile == INVALID_HANDLE_VALUE) {
-        return false;
+    if (hFile != INVALID_HANDLE_VALUE) {
+        // Сохраняем в UTF-8 с BOM (0xEF, 0xBB, 0xBF)
+        BYTE bom[] = { 0xEF, 0xBB, 0xBF };
+        DWORD dwWritten = 0;
+        WriteFile(hFile, bom, sizeof(bom), &dwWritten, NULL);
+
+        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, comment.c_str(), (int)comment.length(), NULL, 0, NULL, NULL);
+        if (utf8Len > 0) {
+            std::vector<char> utf8Buf(utf8Len);
+            WideCharToMultiByte(CP_UTF8, 0, comment.c_str(), (int)comment.length(), utf8Buf.data(), utf8Len, NULL, NULL);
+            WriteFile(hFile, utf8Buf.data(), utf8Len, &dwWritten, NULL);
+        }
+        CloseHandle(hFile);
     }
 
-    // Сохраняем в UTF-8 с BOM (0xEF, 0xBB, 0xBF)
-    BYTE bom[] = { 0xEF, 0xBB, 0xBF };
-    DWORD dwWritten = 0;
-    WriteFile(hFile, bom, sizeof(bom), &dwWritten, NULL);
+    // 2. СИНХРОННАЯ ЗАПИСЬ ДЛЯ ПАПОК В desktop.ini (InfoTip):
+    // Это критически необходимо, чтобы комментарий папки отображался в:
+    // - Левой навигационной панели Проводника Windows (дерево папок)
+    // - Плитках закрепленных папок в секции «Быстрый доступ» (Quick Access)
+    // - Заголовках окон и хлебных крошках Проводника
+    if (isDir) {
+        std::wstring norm = NormalizePathForADS(filePath);
+        std::wstring iniPath = norm + L"\\desktop.ini";
 
-    int utf8Len = WideCharToMultiByte(CP_UTF8, 0, comment.c_str(), (int)comment.length(), NULL, 0, NULL, NULL);
-    if (utf8Len > 0) {
-        std::vector<char> utf8Buf(utf8Len);
-        WideCharToMultiByte(CP_UTF8, 0, comment.c_str(), (int)comment.length(), utf8Buf.data(), utf8Len, NULL, NULL);
-        WriteFile(hFile, utf8Buf.data(), utf8Len, &dwWritten, NULL);
+        // Снимаем скрытый и системный атрибуты перед редактированием desktop.ini
+        DWORD iniAttrs = GetFileAttributesW(iniPath.c_str());
+        if (iniAttrs != INVALID_FILE_ATTRIBUTES) {
+            SetFileAttributesW(iniPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+        }
+
+        // Записываем ключ InfoTip в секцию [.ShellClassInfo]
+        WritePrivateProfileStringW(L".ShellClassInfo", L"InfoTip", comment.c_str(), iniPath.c_str());
+        // Также записываем в секцию [SummaryInformation] Comment для совместимости со старыми и новыми обработчиками
+        WritePrivateProfileStringW(L"SummaryInformation", L"Comment", comment.c_str(), iniPath.c_str());
+
+        // Возвращаем скрытый и системный атрибуты desktop.ini
+        SetFileAttributesW(iniPath.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+
+        // ОБЯЗАТЕЛЬНО: Папка ДОЛЖНА иметь атрибут FILE_ATTRIBUTE_READONLY или FILE_ATTRIBUTE_SYSTEM!
+        // В Windows Explorer атрибут Read-Only для папок используется как флаг парсинга desktop.ini!
+        SetFileAttributesW(norm.c_str(), dwAttr | FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM);
+
+        // Оповещаем Windows Explorer об изменении элемента папки
+        SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, norm.c_str(), NULL);
     }
 
-    CloseHandle(hFile);
+    // 3. Синхронизируем ярлыки в системной папке «Недавние» (%APPDATA%\Microsoft\Windows\Recent):
+    // При наведении на ярлык в секциях «Недавние» и «Главная» родной обработчик shell32.dll сразу показывает заметку!
+    UpdateRecentShortcutDescription(filePath, comment);
+
     return true;
 }
 
 static bool DeleteComment(const std::wstring& filePath) {
     std::wstring adsPath = NormalizePathForADS(filePath) + L":comment";
-    return DeleteFileW(adsPath.c_str()) != FALSE;
+    bool ok = DeleteFileW(adsPath.c_str()) != FALSE;
+
+    DWORD dwAttr = GetFileAttributesW(filePath.c_str());
+    if (dwAttr != INVALID_FILE_ATTRIBUTES && (dwAttr & FILE_ATTRIBUTE_DIRECTORY)) {
+        std::wstring norm = NormalizePathForADS(filePath);
+        std::wstring iniPath = norm + L"\\desktop.ini";
+        DWORD iniAttrs = GetFileAttributesW(iniPath.c_str());
+        if (iniAttrs != INVALID_FILE_ATTRIBUTES) {
+            SetFileAttributesW(iniPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+            WritePrivateProfileStringW(L".ShellClassInfo", L"InfoTip", NULL, iniPath.c_str());
+            WritePrivateProfileStringW(L"SummaryInformation", L"Comment", NULL, iniPath.c_str());
+            SetFileAttributesW(iniPath.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+            SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, norm.c_str(), NULL);
+        }
+    }
+
+    UpdateRecentShortcutDescription(filePath, L"");
+    return ok;
 }
 
 // ----------------------------------------------------------------------------
@@ -913,33 +1150,54 @@ static bool BrowseForFolder(HWND hWndParent, std::wstring& outFolder) {
 // ----------------------------------------------------------------------------
 // Интеграция с контекстным меню Проводника (Right-Click Context Menu)
 // ----------------------------------------------------------------------------
-// Поддерживает многоязычный MUIVerb со ссылкой на строковые ресурсы EXE файла (@FileCommentEditor.exe,-101, -102).
-// Windows Explorer автоматически отображает пункты на языке Windows текущего пользователя!
-// Также задает значение по умолчанию (Default) для программ без поддержки MUIVerb.
+// Прямая запись чистого Unicode (UTF-16) значения по умолчанию (Default) в реестр.
+// Полное удаление устаревших/кэшированных MUIVerb и очистка MuiCache для исключения «кракозябр»!
+
+static void PurgeMuiCacheKey(HKEY hRoot, const wchar_t* subKey) {
+    HKEY hKey;
+    if (RegOpenKeyExW(hRoot, subKey, 0, KEY_READ | KEY_WRITE, &hKey) == ERROR_SUCCESS) {
+        wchar_t valName[512];
+        DWORD valLen = ARRAYSIZE(valName);
+        DWORD index = 0;
+        std::vector<std::wstring> toDelete;
+        while (RegEnumValueW(hKey, index, valName, &valLen, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+            if (wcsstr(valName, L"FileCommentEditor") != NULL || wcsstr(valName, L"FileCommentSearch") != NULL) {
+                toDelete.push_back(valName);
+            }
+            index++;
+            valLen = ARRAYSIZE(valName);
+        }
+        for (const auto& v : toDelete) {
+            RegDeleteValueW(hKey, v.c_str());
+        }
+        RegCloseKey(hKey);
+    }
+}
+
 static bool RegisterContextVerbInHive(
     HKEY hRoot,
     const std::wstring& targetClass,
     const std::wstring& verbKey,
     const std::wstring& displayText,
-    int muiStringResId,
     const std::wstring& exePath,
-    const std::wstring& commandParam
+    const std::wstring& commandParam,
+    bool isClassesRootDirect = false
 ) {
-    std::wstring basePath = L"Software\\Classes\\" + targetClass + L"\\shell\\" + verbKey;
+    std::wstring basePath = isClassesRootDirect ? 
+        (targetClass + L"\\shell\\" + verbKey) :
+        (L"Software\\Classes\\" + targetClass + L"\\shell\\" + verbKey);
     std::wstring cmdPath = basePath + L"\\command";
 
-    // 1. Отображаемое имя по умолчанию
+    // Очищаем старые ключи для удаления возможного поврежденного MUIVerb
+    RegDeleteTreeW(hRoot, basePath.c_str());
+
+    // 1. Отображаемое имя по умолчанию (Default) — читается Проводником напрямую как UTF-16
     RegSetStringValue(hRoot, basePath, NULL, displayText);
 
-    // 2. Многоязычный MUIVerb: Windows Explorer загружает текст на языке интерфейса пользователя
-    wchar_t szMuiVerb[MAX_PATH + 32];
-    StringCchPrintfW(szMuiVerb, ARRAYSIZE(szMuiVerb), L"@\"%s\",-%d", exePath.c_str(), muiStringResId);
-    RegSetStringValue(hRoot, basePath, L"MUIVerb", szMuiVerb);
-
-    // 3. Иконка из EXE файла
+    // 2. Иконка из EXE файла
     RegSetStringValue(hRoot, basePath, L"Icon", exePath);
 
-    // 4. Командная строка вызова
+    // 3. Командная строка вызова
     wchar_t szFullCmd[MAX_PATH + 64];
     StringCchPrintfW(szFullCmd, ARRAYSIZE(szFullCmd), L"\"%s\" %s", exePath.c_str(), commandParam.c_str());
     RegSetStringValue(hRoot, cmdPath, NULL, szFullCmd);
@@ -955,40 +1213,101 @@ static bool InstallContextMenu() {
     std::wstring verbComment = GetStr(STR_CTX_COMMENT_VERB);
     std::wstring verbSearch = GetStr(STR_CTX_SEARCH_VERB);
 
-    HKEY hives[2] = { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE };
+    std::vector<HKEY> hives;
+    hives.push_back(HKEY_CURRENT_USER);
+    hives.push_back(HKEY_LOCAL_MACHINE);
 
-    for (int h = 0; h < 2; h++) {
-        HKEY root = hives[h];
-
-        // 1. Для всех файлов (*) -> "Комментировать..." (MUI ID 101)
-        RegisterContextVerbInHive(root, L"*", L"FileCommentEditor", verbComment, 101, szExePath, L"\"%1\"");
-
-        // 2. Для папок (Folder и Directory) -> "Комментировать..." (MUI ID 101)
-        RegisterContextVerbInHive(root, L"Folder", L"FileCommentEditor", verbComment, 101, szExePath, L"\"%1\"");
-        RegisterContextVerbInHive(root, L"Directory", L"FileCommentEditor", verbComment, 101, szExePath, L"\"%1\"");
-
-        // 3. Для папок (Directory и Folder) -> "Искать в заметках..." (MUI ID 102)
-        RegisterContextVerbInHive(root, L"Directory", L"FileCommentSearch", verbSearch, 102, szExePath, L"--search-gui \"%1\"");
-        RegisterContextVerbInHive(root, L"Folder", L"FileCommentSearch", verbSearch, 102, szExePath, L"--search-gui \"%1\"");
-
-        // 4. Для пустого места внутри открытой папки (Background) -> "Искать в заметках..." (MUI ID 102)
-        RegisterContextVerbInHive(root, L"Directory\\Background", L"FileCommentSearch", verbSearch, 102, szExePath, L"--search-gui \"%V\"");
-        RegisterContextVerbInHive(root, L"LibraryFolder\\Background", L"FileCommentSearch", verbSearch, 102, szExePath, L"--search-gui \"%V\"");
-
-        // 5. Для дисков (Drive) -> "Искать в заметках..." и "Комментировать..."
-        RegisterContextVerbInHive(root, L"Drive", L"FileCommentSearch", verbSearch, 102, szExePath, L"--search-gui \"%1\"");
-        RegisterContextVerbInHive(root, L"Drive", L"FileCommentEditor", verbComment, 101, szExePath, L"\"%1\"");
+    // Также опрашиваем все активные профили пользователей в HKEY_USERS (чтобы обновить пользователя при UAC)
+    HKEY hUsers;
+    if (RegOpenKeyExW(HKEY_USERS, NULL, 0, KEY_READ, &hUsers) == ERROR_SUCCESS) {
+        wchar_t subName[256];
+        DWORD subLen = ARRAYSIZE(subName);
+        DWORD index = 0;
+        while (RegEnumKeyExW(hUsers, index, subName, &subLen, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+            if (wcsncmp(subName, L"S-1-5-21-", 9) == 0 && wcsstr(subName, L"_Classes") == NULL) {
+                HKEY hUser;
+                if (RegOpenKeyExW(HKEY_USERS, subName, 0, KEY_READ | KEY_WRITE, &hUser) == ERROR_SUCCESS) {
+                    hives.push_back(hUser);
+                }
+            }
+            index++;
+            subLen = ARRAYSIZE(subName);
+        }
+        RegCloseKey(hUsers);
     }
+
+    for (HKEY root : hives) {
+        // Очистка кэша MUI в каждом профиле
+        PurgeMuiCacheKey(root, L"Software\\Classes\\Local Settings\\MuiCache");
+        PurgeMuiCacheKey(root, L"Software\\Microsoft\\Windows\\Shell\\MuiCache");
+
+        // 1. Для всех файлов (*) и AllFilesystemObjects
+        RegisterContextVerbInHive(root, L"*", L"FileCommentEditor", verbComment, szExePath, L"\"%1\"");
+        RegisterContextVerbInHive(root, L"AllFilesystemObjects", L"FileCommentEditor", verbComment, szExePath, L"\"%1\"");
+        RegisterContextVerbInHive(root, L"lnkfile", L"FileCommentEditor", verbComment, szExePath, L"\"%1\"");
+
+        // 2. Для папок (Folder и Directory)
+        RegisterContextVerbInHive(root, L"Folder", L"FileCommentEditor", verbComment, szExePath, L"\"%1\"");
+        RegisterContextVerbInHive(root, L"Directory", L"FileCommentEditor", verbComment, szExePath, L"\"%1\"");
+
+        // 3. Поиск в заметках для папок
+        RegisterContextVerbInHive(root, L"Directory", L"FileCommentSearch", verbSearch, szExePath, L"--search-gui \"%1\"");
+        RegisterContextVerbInHive(root, L"Folder", L"FileCommentSearch", verbSearch, szExePath, L"--search-gui \"%1\"");
+
+        // 4. Для пустого места внутри открытой папки (Background)
+        RegisterContextVerbInHive(root, L"Directory\\Background", L"FileCommentSearch", verbSearch, szExePath, L"--search-gui \"%V\"");
+        RegisterContextVerbInHive(root, L"LibraryFolder\\Background", L"FileCommentSearch", verbSearch, szExePath, L"--search-gui \"%V\"");
+
+        // 5. Для дисков (Drive)
+        RegisterContextVerbInHive(root, L"Drive", L"FileCommentSearch", verbSearch, szExePath, L"--search-gui \"%1\"");
+        RegisterContextVerbInHive(root, L"Drive", L"FileCommentEditor", verbComment, szExePath, L"\"%1\"");
+
+        if (root != HKEY_CURRENT_USER && root != HKEY_LOCAL_MACHINE) {
+            RegCloseKey(root);
+        }
+    }
+
+    // Дополнительно записываем в HKEY_CLASSES_ROOT напрямую
+    RegisterContextVerbInHive(HKEY_CLASSES_ROOT, L"*", L"FileCommentEditor", verbComment, szExePath, L"\"%1\"", true);
+    RegisterContextVerbInHive(HKEY_CLASSES_ROOT, L"AllFilesystemObjects", L"FileCommentEditor", verbComment, szExePath, L"\"%1\"", true);
+    RegisterContextVerbInHive(HKEY_CLASSES_ROOT, L"Folder", L"FileCommentEditor", verbComment, szExePath, L"\"%1\"", true);
+    RegisterContextVerbInHive(HKEY_CLASSES_ROOT, L"Directory", L"FileCommentEditor", verbComment, szExePath, L"\"%1\"", true);
+    RegisterContextVerbInHive(HKEY_CLASSES_ROOT, L"Drive", L"FileCommentEditor", verbComment, szExePath, L"\"%1\"", true);
+    RegisterContextVerbInHive(HKEY_CLASSES_ROOT, L"lnkfile", L"FileCommentEditor", verbComment, szExePath, L"\"%1\"", true);
+    RegisterContextVerbInHive(HKEY_CLASSES_ROOT, L"Directory\\Background", L"FileCommentSearch", verbSearch, szExePath, L"--search-gui \"%V\"", true);
+    RegisterContextVerbInHive(HKEY_CLASSES_ROOT, L"LibraryFolder\\Background", L"FileCommentSearch", verbSearch, szExePath, L"--search-gui \"%V\"", true);
 
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
     return true;
 }
 
 static bool UninstallContextMenu() {
-    HKEY hives[2] = { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE };
-    for (int h = 0; h < 2; h++) {
-        HKEY root = hives[h];
+    std::vector<HKEY> hives;
+    hives.push_back(HKEY_CURRENT_USER);
+    hives.push_back(HKEY_LOCAL_MACHINE);
+
+    HKEY hUsers;
+    if (RegOpenKeyExW(HKEY_USERS, NULL, 0, KEY_READ, &hUsers) == ERROR_SUCCESS) {
+        wchar_t subName[256];
+        DWORD subLen = ARRAYSIZE(subName);
+        DWORD index = 0;
+        while (RegEnumKeyExW(hUsers, index, subName, &subLen, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+            if (wcsncmp(subName, L"S-1-5-21-", 9) == 0 && wcsstr(subName, L"_Classes") == NULL) {
+                HKEY hUser;
+                if (RegOpenKeyExW(HKEY_USERS, subName, 0, KEY_READ | KEY_WRITE, &hUser) == ERROR_SUCCESS) {
+                    hives.push_back(hUser);
+                }
+            }
+            index++;
+            subLen = ARRAYSIZE(subName);
+        }
+        RegCloseKey(hUsers);
+    }
+
+    for (HKEY root : hives) {
         RegDeleteTreeW(root, L"Software\\Classes\\*\\shell\\FileCommentEditor");
+        RegDeleteTreeW(root, L"Software\\Classes\\AllFilesystemObjects\\shell\\FileCommentEditor");
+        RegDeleteTreeW(root, L"Software\\Classes\\lnkfile\\shell\\FileCommentEditor");
         RegDeleteTreeW(root, L"Software\\Classes\\Folder\\shell\\FileCommentEditor");
         RegDeleteTreeW(root, L"Software\\Classes\\Directory\\shell\\FileCommentEditor");
         RegDeleteTreeW(root, L"Software\\Classes\\Directory\\shell\\FileCommentSearch");
@@ -997,7 +1316,24 @@ static bool UninstallContextMenu() {
         RegDeleteTreeW(root, L"Software\\Classes\\LibraryFolder\\Background\\shell\\FileCommentSearch");
         RegDeleteTreeW(root, L"Software\\Classes\\Drive\\shell\\FileCommentSearch");
         RegDeleteTreeW(root, L"Software\\Classes\\Drive\\shell\\FileCommentEditor");
+
+        PurgeMuiCacheKey(root, L"Software\\Classes\\Local Settings\\MuiCache");
+        PurgeMuiCacheKey(root, L"Software\\Microsoft\\Windows\\Shell\\MuiCache");
+
+        if (root != HKEY_CURRENT_USER && root != HKEY_LOCAL_MACHINE) {
+            RegCloseKey(root);
+        }
     }
+
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, L"*\\shell\\FileCommentEditor");
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, L"AllFilesystemObjects\\shell\\FileCommentEditor");
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, L"Folder\\shell\\FileCommentEditor");
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, L"Directory\\shell\\FileCommentEditor");
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, L"Drive\\shell\\FileCommentEditor");
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, L"lnkfile\\shell\\FileCommentEditor");
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, L"Directory\\Background\\shell\\FileCommentSearch");
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, L"LibraryFolder\\Background\\shell\\FileCommentSearch");
+
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
     return true;
 }
@@ -1275,6 +1611,111 @@ static bool ImportCommentsFromJson(const std::wstring& jsonFilePath, DWORD& outT
 }
 
 // ----------------------------------------------------------------------------
+// Синхронизация существующих заметок папок с desktop.ini для Проводника
+// (Обеспечивает показ подсказок в левой навигационной панели, плитках Быстрого доступа и Избранном)
+// ----------------------------------------------------------------------------
+static void SyncFolderDesktopIniRecursive(const std::wstring& dirPath, DWORD& outCount) {
+    // 1. Проверяем саму папку dirPath на наличие заметки в потоке NTFS :comment
+    std::wstring adsPath = NormalizePathForADS(dirPath) + L":comment";
+    HANDLE hFile = CreateFileW(
+        adsPath.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        NULL
+    );
+
+    if (hFile != INVALID_HANDLE_VALUE) {
+        DWORD dwSizeLow = GetFileSize(hFile, NULL);
+        if (dwSizeLow > 0 && dwSizeLow <= 65536) {
+            std::vector<BYTE> buffer(dwSizeLow + 4, 0);
+            DWORD dwRead = 0;
+            ReadFile(hFile, buffer.data(), dwSizeLow, &dwRead, NULL);
+            CloseHandle(hFile);
+
+            std::wstring comment;
+            if (dwRead >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF) {
+                int wlen = MultiByteToWideChar(CP_UTF8, 0, (const char*)buffer.data() + 3, dwRead - 3, NULL, 0);
+                if (wlen > 0) {
+                    comment.resize(wlen);
+                    MultiByteToWideChar(CP_UTF8, 0, (const char*)buffer.data() + 3, dwRead - 3, &comment[0], wlen);
+                }
+            } else if (dwRead >= 2 && buffer[0] == 0xFF && buffer[1] == 0xFE) {
+                int chars = (dwRead - 2) / sizeof(wchar_t);
+                comment.assign((const wchar_t*)(buffer.data() + 2), chars);
+            } else {
+                int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (const char*)buffer.data(), dwRead, NULL, 0);
+                if (wlen > 0) {
+                    comment.resize(wlen);
+                    MultiByteToWideChar(CP_UTF8, 0, (const char*)buffer.data(), dwRead, &comment[0], wlen);
+                } else {
+                    int wlenA = MultiByteToWideChar(CP_ACP, 0, (const char*)buffer.data(), dwRead, NULL, 0);
+                    if (wlenA > 0) {
+                        comment.resize(wlenA);
+                        MultiByteToWideChar(CP_ACP, 0, (const char*)buffer.data(), dwRead, &comment[0], wlenA);
+                    }
+                }
+            }
+
+            while (!comment.empty() && (comment.back() == L'\r' || comment.back() == L'\n' || comment.back() == L' ')) {
+                comment.pop_back();
+            }
+
+            if (!comment.empty()) {
+                std::wstring norm = NormalizePathForADS(dirPath);
+                std::wstring iniPath = norm + L"\\desktop.ini";
+
+                DWORD iniAttrs = GetFileAttributesW(iniPath.c_str());
+                if (iniAttrs != INVALID_FILE_ATTRIBUTES) {
+                    SetFileAttributesW(iniPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+                }
+                WritePrivateProfileStringW(L".ShellClassInfo", L"InfoTip", comment.c_str(), iniPath.c_str());
+                WritePrivateProfileStringW(L"SummaryInformation", L"Comment", comment.c_str(), iniPath.c_str());
+                SetFileAttributesW(iniPath.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+
+                DWORD dwDirAttr = GetFileAttributesW(norm.c_str());
+                if (dwDirAttr != INVALID_FILE_ATTRIBUTES) {
+                    SetFileAttributesW(norm.c_str(), dwDirAttr | FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM);
+                }
+                SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, norm.c_str(), NULL);
+                outCount++;
+            }
+        } else {
+            CloseHandle(hFile);
+        }
+    }
+
+    // 2. Рекурсивный обход вложенных каталогов
+    std::wstring searchPattern = dirPath;
+    if (searchPattern.back() != L'\\' && searchPattern.back() != L'/') searchPattern += L'\\';
+    searchPattern += L"*";
+
+    WIN32_FIND_DATAW wfd;
+    HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &wfd);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(wfd.cFileName, L".") == 0 || wcscmp(wfd.cFileName, L"..") == 0) continue;
+            if (wfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                // Пропускаем системные служебные папки
+                if ((wfd.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM) && (wfd.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN)) {
+                    if (_wcsicmp(wfd.cFileName, L"$Recycle.Bin") == 0 ||
+                        _wcsicmp(wfd.cFileName, L"System Volume Information") == 0) {
+                        continue;
+                    }
+                }
+                std::wstring subDir = dirPath;
+                if (subDir.back() != L'\\' && subDir.back() != L'/') subDir += L'\\';
+                subDir += wfd.cFileName;
+                SyncFolderDesktopIniRecursive(subDir, outCount);
+            }
+        } while (FindNextFileW(hFind, &wfd));
+        FindClose(hFind);
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Регистрация DLL расширения через regsvr32
 // ----------------------------------------------------------------------------
 static bool ExecuteRegsvr(bool unregister) {
@@ -1356,24 +1797,81 @@ static void ShowTrayBalloon(HWND hWnd, const std::wstring& title, const std::wst
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
-static bool ApplyGlobalHotkey(HWND hWnd) {
+static bool ApplyGlobalHotkey(HWND hWnd, bool bIsExplicitUserAction = false) {
     if (g_hotkeyRegistered) {
         UnregisterHotKey(hWnd, ID_HOTKEY_GLOBAL);
         g_hotkeyRegistered = false;
     }
 
+    // 1. Пробуем зарегистрировать текущий хоткей
     if (RegisterHotKey(hWnd, ID_HOTKEY_GLOBAL, g_hotkeyMods, g_hotkeyVK)) {
         g_hotkeyRegistered = true;
         std::wstring str = FormatHotkeyString(g_hotkeyMods, g_hotkeyVK);
         wchar_t buf[256];
         StringCchPrintfW(buf, ARRAYSIZE(buf), GetStr(STR_HOTKEY_STATUS_OK).c_str(), str.c_str());
         SetDlgItemTextW(hWnd, IDC_ST_HOTKEY_STATUS, buf);
-        SetupTrayIcon(hWnd, true); // обновить тултип в трее
+        SetupTrayIcon(hWnd, true);
         return true;
-    } else {
-        SetDlgItemTextW(hWnd, IDC_ST_HOTKEY_STATUS, GetStr(STR_HOTKEY_STATUS_FAIL).c_str());
-        return false;
     }
+
+    // 2. Если это автоматический запуск или старт в трее, а хоткей конфликтует с системой:
+    // перебираем свободные и безопасные варианты без вывода сообщений об ошибке
+    if (!bIsExplicitUserAction) {
+        struct FallbackCombo {
+            UINT mods;
+            UINT vk;
+        } fallbacks[] = {
+            { MOD_CONTROL | MOD_SHIFT, 'F' },
+            { MOD_CONTROL | MOD_SHIFT, 'K' },
+            { MOD_CONTROL | MOD_ALT, 'C' },
+            { MOD_ALT | MOD_SHIFT, 'F' },
+            { MOD_CONTROL | MOD_SHIFT, VK_SPACE },
+            { MOD_CONTROL | MOD_ALT, 'K' },
+            { MOD_CONTROL | MOD_SHIFT, 'S' }
+        };
+
+        for (const auto& fb : fallbacks) {
+            if (fb.mods == g_hotkeyMods && fb.vk == g_hotkeyVK) continue;
+            if (RegisterHotKey(hWnd, ID_HOTKEY_GLOBAL, fb.mods, fb.vk)) {
+                g_hotkeyRegistered = true;
+                g_hotkeyMods = fb.mods;
+                g_hotkeyVK = fb.vk;
+                SaveAppSettings();
+
+                // Синхронизируем состояние чекбоксов в окне
+                CheckDlgButton(hWnd, IDC_CHK_HOTKEY_WIN, (g_hotkeyMods & MOD_WIN) ? BST_CHECKED : BST_UNCHECKED);
+                CheckDlgButton(hWnd, IDC_CHK_HOTKEY_CTRL, (g_hotkeyMods & MOD_CONTROL) ? BST_CHECKED : BST_UNCHECKED);
+                CheckDlgButton(hWnd, IDC_CHK_HOTKEY_ALT, (g_hotkeyMods & MOD_ALT) ? BST_CHECKED : BST_UNCHECKED);
+                CheckDlgButton(hWnd, IDC_CHK_HOTKEY_SHIFT, (g_hotkeyMods & MOD_SHIFT) ? BST_CHECKED : BST_UNCHECKED);
+
+                HWND hCmbKey = GetDlgItem(hWnd, IDC_CMB_HOTKEY_KEY);
+                if (hCmbKey) {
+                    for (int i = 0; i < (int)ARRAYSIZE(g_allHotkeyKeys); i++) {
+                        if (g_allHotkeyKeys[i].vk == g_hotkeyVK) {
+                            SendMessageW(hCmbKey, CB_SETCURSEL, i, 0);
+                            break;
+                        }
+                    }
+                }
+
+                std::wstring str = FormatHotkeyString(g_hotkeyMods, g_hotkeyVK);
+                wchar_t buf[256];
+                StringCchPrintfW(buf, ARRAYSIZE(buf), GetStr(STR_HOTKEY_STATUS_OK).c_str(), str.c_str());
+                SetDlgItemTextW(hWnd, IDC_ST_HOTKEY_STATUS, buf);
+                SetupTrayIcon(hWnd, true);
+                return true;
+            }
+        }
+    }
+
+    SetDlgItemTextW(hWnd, IDC_ST_HOTKEY_STATUS, GetStr(STR_HOTKEY_STATUS_FAIL).c_str());
+    if (bIsExplicitUserAction) {
+        std::wstring failMsg = (g_currentLang == LANG_RU)
+            ? L"Не удалось зарегистрировать эту комбинацию клавиш.\n\nВозможно, она уже используется Windows (например, Copilot, Кортаной) или другим активным приложением.\n\nПопробуйте выбрать сочетание с Ctrl или Alt (например, Ctrl + Shift + F)."
+            : L"Failed to register this hotkey combination.\n\nIt might be reserved by Windows or another application.\n\nPlease choose a combination with Ctrl or Alt (e.g. Ctrl + Shift + F).";
+        MessageBoxW(hWnd, failMsg.c_str(), L"Hotkey Conflict", MB_ICONWARNING);
+    }
+    return false;
 }
 
 // ----------------------------------------------------------------------------
@@ -1958,14 +2456,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 
         HWND hCmbKey = CreateWindowExW(0, L"COMBOBOX", L"",
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            415, 329, 75, 150, hWnd, (HMENU)IDC_CMB_HOTKEY_KEY, g_hInstance, NULL);
+            415, 329, 85, 360, hWnd, (HMENU)IDC_CMB_HOTKEY_KEY, g_hInstance, NULL);
 
-        // Заполнение списка клавиш
-        const wchar_t* keys[] = { L"C", L"F", L"K", L"S", L"O", L"Space", L"F1", L"F2", L"F3", L"F4", L"F8", L"F9", L"F12" };
-        for (const auto& k : keys) {
-            SendMessageW(hCmbKey, CB_ADDSTRING, 0, (LPARAM)k);
+        // Заполнение расширенного списка клавиш (буквы A-Z, цифры 0-9, F1-F12, спецклавиши)
+        int selectIdx = 0;
+        for (int i = 0; i < (int)ARRAYSIZE(g_allHotkeyKeys); i++) {
+            LRESULT idx = SendMessageW(hCmbKey, CB_ADDSTRING, 0, (LPARAM)g_allHotkeyKeys[i].label);
+            SendMessageW(hCmbKey, CB_SETITEMDATA, idx, (LPARAM)g_allHotkeyKeys[i].vk);
+            if (g_allHotkeyKeys[i].vk == g_hotkeyVK) {
+                selectIdx = i;
+            }
         }
-        SendMessageW(hCmbKey, CB_SETCURSEL, 0, 0); // По умолчанию "C"
+        SendMessageW(hCmbKey, CB_SETCURSEL, selectIdx, 0);
+        SendMessageW(hCmbKey, CB_SETMINVISIBLE, 15, 0);
 
         // Выбор действия по хоткею
         HWND hCmbAct = CreateWindowExW(0, L"COMBOBOX", L"",
@@ -2054,22 +2557,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 
             HWND hCmbKey = GetDlgItem(hWnd, IDC_CMB_HOTKEY_KEY);
             int cur = (int)SendMessageW(hCmbKey, CB_GETCURSEL, 0, 0);
-            UINT vk = 'C';
-            switch (cur) {
-            case 0: vk = 'C'; break;
-            case 1: vk = 'F'; break;
-            case 2: vk = 'K'; break;
-            case 3: vk = 'S'; break;
-            case 4: vk = 'O'; break;
-            case 5: vk = VK_SPACE; break;
-            case 6: vk = VK_F1; break;
-            case 7: vk = VK_F2; break;
-            case 8: vk = VK_F3; break;
-            case 9: vk = VK_F4; break;
-            case 10: vk = VK_F8; break;
-            case 11: vk = VK_F9; break;
-            case 12: vk = VK_F12; break;
-            default: vk = 'C'; break;
+            UINT vk = 'F';
+            if (cur != CB_ERR) {
+                LRESULT data = SendMessageW(hCmbKey, CB_GETITEMDATA, cur, 0);
+                if (data != CB_ERR && data != 0) {
+                    vk = (UINT)data;
+                }
             }
 
             HWND hCmbAct = GetDlgItem(hWnd, IDC_CMB_HOTKEY_ACTION);
@@ -2080,7 +2573,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
             g_hotkeyAction = act;
 
             SaveAppSettings();
-            ApplyGlobalHotkey(hWnd);
+            ApplyGlobalHotkey(hWnd, true); // Явное действие пользователя — покажет предупреждение при конфликте
             break;
         }
 
@@ -2146,8 +2639,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
             HMENU hMenu = CreatePopupMenu();
             std::wstring strExport = GetStr(STR_MENU_BACKUP_EXPORT);
             std::wstring strImport = GetStr(STR_MENU_BACKUP_IMPORT);
+            std::wstring strSync = GetStr(STR_MENU_BACKUP_SYNC);
             AppendMenuW(hMenu, MF_STRING, ID_BACKUP_EXPORT, strExport.c_str());
             AppendMenuW(hMenu, MF_STRING, ID_BACKUP_IMPORT, strImport.c_str());
+            AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+            AppendMenuW(hMenu, MF_STRING, ID_BACKUP_SYNC_FOLDERS, strSync.c_str());
 
             SetForegroundWindow(hWnd);
             int cmd = TrackPopupMenu(hMenu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD, pt.x, pt.y, 0, hWnd, NULL);
@@ -2228,6 +2724,52 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
                             MessageBoxW(hWnd, (g_currentLang == LANG_RU) ? L"Ошибка при чтении файла резервной копии!" : L"Failed to read backup file!", L"Error", MB_ICONERROR);
                         }
                     }
+                }
+            } else if (cmd == ID_BACKUP_SYNC_FOLDERS) {
+                std::wstring scanDir;
+                if (!g_currentFilePath.empty()) {
+                    wchar_t dir[MAX_PATH];
+                    StringCchCopyW(dir, ARRAYSIZE(dir), g_currentFilePath.c_str());
+                    if (!(GetFileAttributesW(dir) & FILE_ATTRIBUTE_DIRECTORY)) {
+                        PathRemoveFileSpecW(dir);
+                    }
+                    scanDir = dir;
+                }
+                if (scanDir.empty()) {
+                    wchar_t cur[MAX_PATH];
+                    GetCurrentDirectoryW(ARRAYSIZE(cur), cur);
+                    scanDir = cur;
+                }
+
+                if (BrowseForFolder(hWnd, scanDir)) {
+                    HCURSOR hOldCur = SetCursor(LoadCursorW(NULL, IDC_WAIT));
+                    DWORD synced = 0;
+                    SyncFolderDesktopIniRecursive(scanDir, synced);
+                    DWORD recentSynced = 0;
+                    SyncAllRecentShortcuts(recentSynced);
+                    InstallContextMenu();
+                    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
+                    SetCursor(hOldCur);
+
+                    wchar_t msg[512];
+                    if (g_currentLang == LANG_RU) {
+                        StringCchPrintfW(msg, ARRAYSIZE(msg), 
+                            L"Синхронизация с Проводником завершена!\n\n"
+                            L"• Обновлено папок (desktop.ini): %u\n"
+                            L"• Обновлено ярлыков в «Недавние» и «Главная»: %u\n"
+                            L"• Обновлены ассоциации контекстного меню и подсказок\n\n"
+                            L"Теперь заметки активны во всех разделах Проводника!",
+                            synced, recentSynced);
+                    } else {
+                        StringCchPrintfW(msg, ARRAYSIZE(msg), 
+                            L"Synchronization with Explorer completed!\n\n"
+                            L"• Updated folders (desktop.ini): %u\n"
+                            L"• Updated shortcuts in Recent/Home: %u\n"
+                            L"• Refreshed context menu & infotip associations\n\n"
+                            L"Notes are now active across all Explorer sections!",
+                            synced, recentSynced);
+                    }
+                    MessageBoxW(hWnd, msg, L"FileCommenter Sync", MB_ICONINFORMATION);
                 }
             }
             break;
@@ -2536,6 +3078,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
             bool ok = ImportCommentsFromJson(jsonPath, total, restored, errors);
             LocalFree(argv);
             return ok ? 0 : 1;
+        } else if (arg1 == L"--sync" || arg1 == L"--sync-folders") {
+            std::wstring scanDir = (argc >= 3) ? argv[2] : L".";
+            DWORD synced = 0;
+            SyncFolderDesktopIniRecursive(scanDir, synced);
+            SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
+            LocalFree(argv);
+            return 0;
         } else if (arg1 == L"--search-gui") {
             std::wstring searchDir;
             if (argc >= 3) searchDir = argv[2];
@@ -2643,6 +3192,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
         // Запущен с автостартом — работаем скрытно в трее
         ShowTrayBalloon(hWnd, GetStr(STR_TRAY_BALLOON_TITLE), GetStr(STR_TRAY_BALLOON_TEXT));
     }
+
+    // Автоматическая фоновая синхронизация ярлыков в Недавних (%APPDATA%\Microsoft\Windows\Recent):
+    // Гарантирует, что для всех файлов тултип в «Главная» и «Недавние» сразу же отображает текст заметки!
+    DWORD startupRecentCount = 0;
+    SyncAllRecentShortcuts(startupRecentCount);
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {

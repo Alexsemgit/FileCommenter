@@ -30,6 +30,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shlwapi.h>
+#include <tlhelp32.h>
 #include <strsafe.h>
 #include <string>
 #include <vector>
@@ -109,7 +110,75 @@ static bool CreateDirRecursive(const std::wstring& path) {
     return CreateDirectoryW(folder, NULL) != FALSE || PathFileExistsW(path.c_str());
 }
 
-// Извлечение встроенного бинарного ресурса в файл на диске
+// Проверка: запущен ли процесс с правами администратора
+static bool IsProcessElevated() {
+    BOOL fRet = FALSE;
+    HANDLE hToken = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        TOKEN_ELEVATION elevation;
+        DWORD cbSize = sizeof(TOKEN_ELEVATION);
+        if (GetTokenInformation(hToken, TokenElevation, &elevation, sizeof(elevation), &cbSize)) {
+            fRet = elevation.TokenIsElevated != 0;
+        }
+        CloseHandle(hToken);
+    }
+    return fRet != FALSE;
+}
+
+// Перезапуск текущего установщика с запросом прав администратора (UAC Elevation)
+static bool RelaunchElevated(HWND hWndParent, const wchar_t* lpCmdLine = L"") {
+    wchar_t szExePath[MAX_PATH];
+    if (GetModuleFileNameW(NULL, szExePath, ARRAYSIZE(szExePath))) {
+        SHELLEXECUTEINFOW sei = { sizeof(sei) };
+        sei.cbSize = sizeof(sei);
+        sei.lpVerb = L"runas"; // Вызов окна подтверждения UAC
+        sei.lpFile = szExePath;
+        sei.lpParameters = (lpCmdLine && wcslen(lpCmdLine) > 0) ? lpCmdLine : NULL;
+        sei.hwnd = hWndParent;
+        sei.nShow = SW_SHOWNORMAL;
+        if (ShellExecuteExW(&sei)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Принудительное завершение всех запущенных копий приложения перед установкой/обновлением
+static void TerminateRunningEditor() {
+    // 1. Пытаемся корректно закрыть окна FileCommenter
+    HWND hWnd = FindWindowW(L"FileCommentEditorWndClass", NULL);
+    for (int attempts = 0; attempts < 5 && hWnd != NULL; ++attempts) {
+        SendMessageW(hWnd, WM_CLOSE, 0, 0);
+        Sleep(100);
+        hWnd = FindWindowW(L"FileCommentEditorWndClass", NULL);
+    }
+
+    // 2. Поиск и принудительное завершение всех процессов FileCommentEditor.exe и TestHarness.exe
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe = { sizeof(pe) };
+        if (Process32FirstW(hSnapshot, &pe)) {
+            do {
+                if (_wcsicmp(pe.szExeFile, L"FileCommentEditor.exe") == 0 ||
+                    _wcsicmp(pe.szExeFile, L"TestHarness.exe") == 0) {
+                    HANDLE hProc = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID);
+                    if (hProc) {
+                        TerminateProcess(hProc, 0);
+                        WaitForSingleObject(hProc, 2000);
+                        CloseHandle(hProc);
+                    }
+                }
+            } while (Process32NextW(hSnapshot, &pe));
+        }
+        CloseHandle(hSnapshot);
+    }
+
+    // 3. Дополнительная страховка через taskkill
+    WinExec("taskkill /f /im FileCommentEditor.exe /im TestHarness.exe >nul 2>&1", SW_HIDE);
+    Sleep(250);
+}
+
+// Извлечение встроенного бинарного ресурса в файл на диске с поддержкой горячей замены занятых файлов
 static bool ExtractResourceToFile(int resId, const std::wstring& targetFilePath) {
     HRSRC hRes = FindResourceW(g_hInstance, MAKEINTRESOURCEW(resId), RT_RCDATA);
     if (!hRes) return false;
@@ -123,7 +192,42 @@ static bool ExtractResourceToFile(int resId, const std::wstring& targetFilePath)
     void* pData = LockResource(hLoaded);
     if (!pData) return false;
 
-    HANDLE hFile = CreateFileW(targetFilePath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    // Снимаем атрибуты "Только для чтения" или "Системный", если они были выставлены
+    DWORD dwOldAttr = GetFileAttributesW(targetFilePath.c_str());
+    if (dwOldAttr != INVALID_FILE_ATTRIBUTES && (dwOldAttr & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM))) {
+        SetFileAttributesW(targetFilePath.c_str(), FILE_ATTRIBUTE_NORMAL);
+    }
+
+    // Попытка 1: открыть и перезаписать напрямую с расширенными флагами общего доступа
+    HANDLE hFile = CreateFileW(targetFilePath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        // Убедимся, что процесс выгружен
+        TerminateRunningEditor();
+        Sleep(200);
+
+        // В Windows заблокированный DLL/EXE нельзя перезаписать напрямую, но МОЖНО переименовать!
+        // Переименовываем старый занятый файл во временное имя:
+        for (int moveTry = 0; moveTry < 5; ++moveTry) {
+            std::wstring oldPath = targetFilePath + L".old_" + std::to_wstring(GetTickCount()) + L"_" + std::to_wstring(moveTry);
+            DeleteFileW(oldPath.c_str());
+            if (MoveFileExW(targetFilePath.c_str(), oldPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                // Помечаем переименованный старый файл на удаление при следующей перезагрузке системы
+                MoveFileExW(oldPath.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+                break;
+            }
+            Sleep(150);
+        }
+
+        // Исходное имя файла освободилось! Создаем новый файл
+        hFile = CreateFileW(targetFilePath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    }
+
+    // Если всё ещё занят, делаем дополнительные попытки с паузой
+    for (int retry = 0; retry < 5 && hFile == INVALID_HANDLE_VALUE; ++retry) {
+        Sleep(250);
+        hFile = CreateFileW(targetFilePath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    }
+
     if (hFile == INVALID_HANDLE_VALUE) return false;
 
     DWORD written = 0;
@@ -143,6 +247,295 @@ static bool RegSetString(HKEY hRoot, const std::wstring& subkey, const wchar_t* 
         return true;
     }
     return false;
+}
+
+// Очистка кэша MUI Windows Explorer от поврежденных/устаревших строк
+static void PurgeMuiCacheKey(HKEY hRoot, const wchar_t* subKey) {
+    HKEY hKey;
+    if (RegOpenKeyExW(hRoot, subKey, 0, KEY_READ | KEY_WRITE, &hKey) == ERROR_SUCCESS) {
+        wchar_t valName[512];
+        DWORD valLen = ARRAYSIZE(valName);
+        DWORD index = 0;
+        std::vector<std::wstring> toDelete;
+        while (RegEnumValueW(hKey, index, valName, &valLen, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+            if (wcsstr(valName, L"FileCommentEditor") != NULL || wcsstr(valName, L"FileCommentTip") != NULL) {
+                toDelete.push_back(valName);
+            }
+            index++;
+            valLen = ARRAYSIZE(valName);
+        }
+        for (const auto& v : toDelete) {
+            RegDeleteValueW(hKey, v.c_str());
+        }
+        RegCloseKey(hKey);
+    }
+}
+
+// Получение списка всех целевых разделов реестра (включая всех пользователей в HKEY_USERS для UAC)
+static std::vector<HKEY> GetAllTargetClassRoots() {
+    std::vector<HKEY> roots;
+    roots.push_back(HKEY_CURRENT_USER);
+    roots.push_back(HKEY_LOCAL_MACHINE);
+
+    HKEY hUsers;
+    if (RegOpenKeyExW(HKEY_USERS, NULL, 0, KEY_READ, &hUsers) == ERROR_SUCCESS) {
+        wchar_t subName[256];
+        DWORD subLen = ARRAYSIZE(subName);
+        DWORD index = 0;
+        while (RegEnumKeyExW(hUsers, index, subName, &subLen, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+            if (wcsncmp(subName, L"S-1-5-21-", 9) == 0 && wcsstr(subName, L"_Classes") == NULL) {
+                HKEY hUser;
+                if (RegOpenKeyExW(HKEY_USERS, subName, 0, KEY_READ | KEY_WRITE, &hUser) == ERROR_SUCCESS) {
+                    roots.push_back(hUser);
+                }
+            }
+            index++;
+            subLen = ARRAYSIZE(subName);
+        }
+        RegCloseKey(hUsers);
+    }
+    return roots;
+}
+
+// Прямая синхронная регистрация пунктов контекстного меню без использования MUIVerb (чистый UTF-16 Default)
+static void PurgeAndRegisterContextMenuDirect(const std::wstring& editorExe, SetupLang lang) {
+    std::wstring verbComment = (lang == SETUP_LANG_RU) ? L"Комментировать..." : L"Comment...";
+    std::wstring verbSearch  = (lang == SETUP_LANG_RU) ? L"Искать в заметках..." : L"Search in comments...";
+
+    std::wstring cmdComment = L"\"" + editorExe + L"\" \"%1\"";
+    std::wstring cmdSearch  = L"\"" + editorExe + L"\" --search-gui \"%1\"";
+    std::wstring cmdSearchBg = L"\"" + editorExe + L"\" --search-gui \"%V\"";
+
+    std::vector<HKEY> hives = GetAllTargetClassRoots();
+
+    for (HKEY root : hives) {
+        PurgeMuiCacheKey(root, L"Software\\Classes\\Local Settings\\MuiCache");
+        PurgeMuiCacheKey(root, L"Software\\Microsoft\\Windows\\Shell\\MuiCache");
+
+        // Удаляем устаревшие ключи
+        RegDeleteTreeW(root, L"Software\\Classes\\*\\shell\\FileCommentEditor");
+        RegDeleteTreeW(root, L"Software\\Classes\\AllFilesystemObjects\\shell\\FileCommentEditor");
+        RegDeleteTreeW(root, L"Software\\Classes\\lnkfile\\shell\\FileCommentEditor");
+        RegDeleteTreeW(root, L"Software\\Classes\\Folder\\shell\\FileCommentEditor");
+        RegDeleteTreeW(root, L"Software\\Classes\\Directory\\shell\\FileCommentEditor");
+        RegDeleteTreeW(root, L"Software\\Classes\\Directory\\shell\\FileCommentSearch");
+        RegDeleteTreeW(root, L"Software\\Classes\\Folder\\shell\\FileCommentSearch");
+        RegDeleteTreeW(root, L"Software\\Classes\\Directory\\Background\\shell\\FileCommentSearch");
+        RegDeleteTreeW(root, L"Software\\Classes\\LibraryFolder\\Background\\shell\\FileCommentSearch");
+        RegDeleteTreeW(root, L"Software\\Classes\\Drive\\shell\\FileCommentSearch");
+        RegDeleteTreeW(root, L"Software\\Classes\\Drive\\shell\\FileCommentEditor");
+
+        // Записываем чистые Unicode-значения (Default) и Icon
+        const wchar_t* commentTargets[] = { L"*", L"AllFilesystemObjects", L"lnkfile", L"Folder", L"Directory", L"Drive" };
+        for (const auto& t : commentTargets) {
+            std::wstring basePath = L"Software\\Classes\\" + std::wstring(t) + L"\\shell\\FileCommentEditor";
+            RegSetString(root, basePath, NULL, verbComment);
+            RegSetString(root, basePath, L"Icon", editorExe);
+            RegSetString(root, basePath + L"\\command", NULL, cmdComment);
+        }
+
+        const wchar_t* searchTargets[] = { L"Directory", L"Folder", L"Drive" };
+        for (const auto& t : searchTargets) {
+            std::wstring basePath = L"Software\\Classes\\" + std::wstring(t) + L"\\shell\\FileCommentSearch";
+            RegSetString(root, basePath, NULL, verbSearch);
+            RegSetString(root, basePath, L"Icon", editorExe);
+            RegSetString(root, basePath + L"\\command", NULL, cmdSearch);
+        }
+
+        const wchar_t* bgTargets[] = { L"Directory\\Background", L"LibraryFolder\\Background" };
+        for (const auto& t : bgTargets) {
+            std::wstring basePath = L"Software\\Classes\\" + std::wstring(t) + L"\\shell\\FileCommentSearch";
+            RegSetString(root, basePath, NULL, verbSearch);
+            RegSetString(root, basePath, L"Icon", editorExe);
+            RegSetString(root, basePath + L"\\command", NULL, cmdSearchBg);
+        }
+
+        if (root != HKEY_CURRENT_USER && root != HKEY_LOCAL_MACHINE) {
+            RegCloseKey(root);
+        }
+    }
+
+    // Запись в HKEY_CLASSES_ROOT напрямую
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, L"*\\shell\\FileCommentEditor");
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, L"AllFilesystemObjects\\shell\\FileCommentEditor");
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, L"lnkfile\\shell\\FileCommentEditor");
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, L"Folder\\shell\\FileCommentEditor");
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, L"Directory\\shell\\FileCommentEditor");
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, L"Directory\\shell\\FileCommentSearch");
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, L"Folder\\shell\\FileCommentSearch");
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, L"Directory\\Background\\shell\\FileCommentSearch");
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, L"LibraryFolder\\Background\\shell\\FileCommentSearch");
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, L"Drive\\shell\\FileCommentSearch");
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, L"Drive\\shell\\FileCommentEditor");
+
+    const wchar_t* commentTargetsCR[] = { L"*", L"AllFilesystemObjects", L"lnkfile", L"Folder", L"Directory", L"Drive" };
+    for (const auto& t : commentTargetsCR) {
+        std::wstring basePath = std::wstring(t) + L"\\shell\\FileCommentEditor";
+        RegSetString(HKEY_CLASSES_ROOT, basePath, NULL, verbComment);
+        RegSetString(HKEY_CLASSES_ROOT, basePath, L"Icon", editorExe);
+        RegSetString(HKEY_CLASSES_ROOT, basePath + L"\\command", NULL, cmdComment);
+    }
+
+    const wchar_t* searchTargetsCR[] = { L"Directory", L"Folder", L"Drive" };
+    for (const auto& t : searchTargetsCR) {
+        std::wstring basePath = std::wstring(t) + L"\\shell\\FileCommentSearch";
+        RegSetString(HKEY_CLASSES_ROOT, basePath, NULL, verbSearch);
+        RegSetString(HKEY_CLASSES_ROOT, basePath, L"Icon", editorExe);
+        RegSetString(HKEY_CLASSES_ROOT, basePath + L"\\command", NULL, cmdSearch);
+    }
+
+    const wchar_t* bgTargetsCR[] = { L"Directory\\Background", L"LibraryFolder\\Background" };
+    for (const auto& t : bgTargetsCR) {
+        std::wstring basePath = std::wstring(t) + L"\\shell\\FileCommentSearch";
+        RegSetString(HKEY_CLASSES_ROOT, basePath, NULL, verbSearch);
+        RegSetString(HKEY_CLASSES_ROOT, basePath, L"Icon", editorExe);
+        RegSetString(HKEY_CLASSES_ROOT, basePath + L"\\command", NULL, cmdSearchBg);
+    }
+}
+
+// Синхронная прямая регистрация Shell Extension DLL (FileCommentTip.dll)
+static bool RegisterShellExtensionDirect(const std::wstring& tipDll) {
+    HMODULE hTip = LoadLibraryExW(tipDll.c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (hTip) {
+        typedef HRESULT (STDAPICALLTYPE *PFNDLLREG)();
+        PFNDLLREG pfn = (PFNDLLREG)GetProcAddress(hTip, "DllRegisterServer");
+        if (pfn) {
+            HRESULT hr = pfn();
+            FreeLibrary(hTip);
+            if (SUCCEEDED(hr)) return true;
+        } else {
+            FreeLibrary(hTip);
+        }
+    }
+
+    // Fallback: синхронный запуск regsvr32 с ожиданием
+    std::wstring regCmd = L"/s \"" + tipDll + L"\"";
+    SHELLEXECUTEINFOW sei = { sizeof(sei) };
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.lpFile = L"regsvr32.exe";
+    sei.lpParameters = regCmd.c_str();
+    sei.nShow = SW_HIDE;
+    if (ShellExecuteExW(&sei) && sei.hProcess) {
+        WaitForSingleObject(sei.hProcess, 5000);
+        CloseHandle(sei.hProcess);
+        return true;
+    }
+    return false;
+}
+
+// Вспомогательное чтение комментария из файла или папки для установщика
+static bool ReadExistingComment(const std::wstring& targetPath, std::wstring& outComment) {
+    outComment.clear();
+    std::wstring norm = targetPath;
+    while (norm.length() > 3 && (norm.back() == L'\\' || norm.back() == L'/')) norm.pop_back();
+
+    std::wstring adsPath = norm + L":comment";
+    HANDLE hFile = CreateFileW(adsPath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        DWORD dwSize = GetFileSize(hFile, NULL);
+        if (dwSize > 0 && dwSize < 65536) {
+            std::vector<BYTE> buf(dwSize);
+            DWORD dwRead = 0;
+            if (ReadFile(hFile, buf.data(), dwSize, &dwRead, NULL) && dwRead > 0) {
+                if (dwRead >= 2 && buf[0] == 0xFF && buf[1] == 0xFE) {
+                    outComment.assign((wchar_t*)(buf.data() + 2), (dwRead - 2) / sizeof(wchar_t));
+                } else if (dwRead >= 3 && buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF) {
+                    int wLen = MultiByteToWideChar(CP_UTF8, 0, (char*)(buf.data() + 3), dwRead - 3, NULL, 0);
+                    if (wLen > 0) {
+                        outComment.resize(wLen);
+                        MultiByteToWideChar(CP_UTF8, 0, (char*)(buf.data() + 3), dwRead - 3, &outComment[0], wLen);
+                    }
+                } else {
+                    int wLen = MultiByteToWideChar(CP_UTF8, 0, (char*)buf.data(), dwRead, NULL, 0);
+                    if (wLen > 0) {
+                        outComment.resize(wLen);
+                        MultiByteToWideChar(CP_UTF8, 0, (char*)buf.data(), dwRead, &outComment[0], wLen);
+                    }
+                }
+            }
+        }
+        CloseHandle(hFile);
+    }
+
+    if (!outComment.empty()) return true;
+
+    DWORD dwAttr = GetFileAttributesW(norm.c_str());
+    if (dwAttr != INVALID_FILE_ATTRIBUTES && (dwAttr & FILE_ATTRIBUTE_DIRECTORY)) {
+        std::wstring ini = norm + L"\\desktop.ini";
+        wchar_t buf[1024] = { 0 };
+        if (GetPrivateProfileStringW(L".ShellClassInfo", L"InfoTip", L"", buf, ARRAYSIZE(buf), ini.c_str()) > 0) {
+            outComment = buf;
+            return true;
+        }
+        if (GetPrivateProfileStringW(L"SummaryInformation", L"Comment", L"", buf, ARRAYSIZE(buf), ini.c_str()) > 0) {
+            outComment = buf;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Синхронизация ярлыков в папке Recent
+static void SyncRecentDirectoryShortcuts(const std::wstring& recentDir) {
+    std::wstring pattern = recentDir + L"\\*.lnk";
+    WIN32_FIND_DATAW wfd;
+    HANDLE hFind = FindFirstFileW(pattern.c_str(), &wfd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+
+    IShellLinkW* psl = NULL;
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLinkW, (void**)&psl))) {
+        IPersistFile* ppf = NULL;
+        if (SUCCEEDED(psl->QueryInterface(IID_IPersistFile, (void**)&ppf))) {
+            do {
+                if (wfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                std::wstring lnkFile = recentDir + L"\\" + wfd.cFileName;
+                if (SUCCEEDED(ppf->Load(lnkFile.c_str(), STGM_READWRITE))) {
+                    wchar_t szTarget[MAX_PATH] = { 0 };
+                    WIN32_FIND_DATAW fd = { 0 };
+                    if (SUCCEEDED(psl->GetPath(szTarget, ARRAYSIZE(szTarget), &fd, SLGP_RAWPATH)) && wcslen(szTarget) > 0) {
+                        std::wstring comment;
+                        if (ReadExistingComment(szTarget, comment) && !comment.empty()) {
+                            std::wstring desc = L"📝 Заметка: " + comment;
+                            psl->SetDescription(desc.c_str());
+                            ppf->Save(lnkFile.c_str(), TRUE);
+                            SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, lnkFile.c_str(), NULL);
+                        }
+                    }
+                }
+            } while (FindNextFileW(hFind, &wfd));
+            ppf->Release();
+        }
+        psl->Release();
+    }
+    FindClose(hFind);
+}
+
+// Полная синхронизация ярлыков Recent для всех пользователей
+static void SyncAllExistingShortcutsAndRecent() {
+    wchar_t szRecent[MAX_PATH] = { 0 };
+    if (SHGetSpecialFolderPathW(NULL, szRecent, CSIDL_RECENT, FALSE)) {
+        SyncRecentDirectoryShortcuts(szRecent);
+    }
+
+    wchar_t szSysDrive[MAX_PATH] = L"C:";
+    GetEnvironmentVariableW(L"SystemDrive", szSysDrive, ARRAYSIZE(szSysDrive));
+    std::wstring usersPattern = std::wstring(szSysDrive) + L"\\Users\\*";
+    WIN32_FIND_DATAW ufd;
+    HANDLE hUsers = FindFirstFileW(usersPattern.c_str(), &ufd);
+    if (hUsers != INVALID_HANDLE_VALUE) {
+        do {
+            if ((ufd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && 
+                wcscmp(ufd.cFileName, L".") != 0 && wcscmp(ufd.cFileName, L"..") != 0 &&
+                _wcsicmp(ufd.cFileName, L"Public") != 0 && _wcsicmp(ufd.cFileName, L"Default") != 0 && 
+                _wcsicmp(ufd.cFileName, L"Default User") != 0 && _wcsicmp(ufd.cFileName, L"All Users") != 0) {
+                std::wstring uRecent = std::wstring(szSysDrive) + L"\\Users\\" + ufd.cFileName + L"\\AppData\\Roaming\\Microsoft\\Windows\\Recent";
+                if (PathFileExistsW(uRecent.c_str())) {
+                    SyncRecentDirectoryShortcuts(uRecent);
+                }
+            }
+        } while (FindNextFileW(hUsers, &ufd));
+        FindClose(hUsers);
+    }
 }
 
 // Создание ярлыка Windows (.lnk)
@@ -307,6 +700,14 @@ static void UpdateTexts(HWND hWnd) {
             SetDlgItemTextW(hWnd, IDC_ST_STATUS, L"Click 'Install' to start installation.");
         }
     }
+
+    HWND hInstallBtn = GetDlgItem(hWnd, IDC_BTN_INSTALL);
+    if (hInstallBtn && !g_bInstalledSuccessfully) {
+        #ifndef BCM_SETSHIELD
+        #define BCM_SETSHIELD 0x0000160C
+        #endif
+        SendMessageW(hInstallBtn, BCM_SETSHIELD, 0, !IsProcessElevated());
+    }
 }
 
 // Процесс установки
@@ -321,6 +722,28 @@ static void DoInstallation(HWND hWnd) {
 
     if (installDir.empty()) {
         MessageBoxW(hWnd, (g_lang == SETUP_LANG_RU) ? L"Укажите папку для установки!" : L"Please specify a destination folder!", L"Error", MB_ICONWARNING);
+        return;
+    }
+
+    // 0. Обязательная проверка прав администратора для записи в Program Files
+    if (!IsProcessElevated()) {
+        std::wstring msg = (g_lang == SETUP_LANG_RU) ?
+            L"Для установки FileCommenter в папку «" + installDir + L"» требуются права администратора.\n\n"
+            L"Перезапустить установщик от имени администратора прямо сейчас?" :
+            L"Administrator privileges are required to install FileCommenter into '" + installDir + L"'.\n\n"
+            L"Relaunch installer with administrator privileges now?";
+
+        int ans = MessageBoxW(hWnd, msg.c_str(), (g_lang == SETUP_LANG_RU) ? L"Требуются права администратора" : L"Administrator Privileges Required", MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON1);
+        if (ans == IDYES) {
+            if (RelaunchElevated(hWnd)) {
+                PostQuitMessage(0);
+                return;
+            }
+        }
+        std::wstring cancelMsg = (g_lang == SETUP_LANG_RU) ?
+            L"Установка отменена. Запись в системную папку «Program Files» заблокирована Windows без прав администратора." :
+            L"Setup cancelled. Writing to 'Program Files' is blocked by Windows without administrator privileges.";
+        MessageBoxW(hWnd, cancelMsg.c_str(), L"FileCommenter", MB_ICONWARNING);
         return;
     }
 
@@ -339,8 +762,8 @@ static void DoInstallation(HWND hWnd) {
 
     if (!CreateDirRecursive(installDir)) {
         std::wstring errMsg = (g_lang == SETUP_LANG_RU) ?
-            L"Не удалось создать папку:\n" + installDir + L"\n\nВозможно требуются права администратора или путь недоступен." :
-            L"Could not create directory:\n" + installDir + L"\n\nAdministrator privileges may be required.";
+            L"Не удалось создать папку:\n" + installDir + L"\n\nОтказано в доступе. Запустите установку от имени администратора." :
+            L"Could not create directory:\n" + installDir + L"\n\nAccess denied. Please run setup as administrator.";
         MessageBoxW(hWnd, errMsg.c_str(), L"Error", MB_ICONERROR);
         EnableWindow(GetDlgItem(hWnd, IDC_BTN_INSTALL), TRUE);
         EnableWindow(GetDlgItem(hWnd, IDC_BTN_CANCEL), TRUE);
@@ -349,7 +772,30 @@ static void DoInstallation(HWND hWnd) {
         return;
     }
 
-    SendMessageW(hProgress, PBM_SETPOS, 20, 0);
+    SendMessageW(hProgress, PBM_SETPOS, 10, 0);
+    SetDlgItemTextW(hWnd, IDC_ST_STATUS, (g_lang == SETUP_LANG_RU) ? L"Выгрузка запущенных процессов FileCommenter..." : L"Stopping running FileCommenter processes...");
+    UpdateWindow(hWnd);
+
+    // Принудительно выгружаем все запущенные экземпляры приложения
+    TerminateRunningEditor();
+
+    // Если в папке уже есть FileCommentTip.dll, временно отзываем регистрацию
+    std::wstring oldTipDll = installDir + L"\\FileCommentTip.dll";
+    if (PathFileExistsW(oldTipDll.c_str())) {
+        std::wstring unregCmd = L"/u /s \"" + oldTipDll + L"\"";
+        SHELLEXECUTEINFOW sei = { sizeof(sei) };
+        sei.lpFile = L"regsvr32.exe";
+        sei.lpParameters = unregCmd.c_str();
+        sei.nShow = SW_HIDE;
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+        if (ShellExecuteExW(&sei) && sei.hProcess) {
+            WaitForSingleObject(sei.hProcess, 1500);
+            CloseHandle(sei.hProcess);
+        }
+    }
+    Sleep(200);
+
+    SendMessageW(hProgress, PBM_SETPOS, 25, 0);
     SetDlgItemTextW(hWnd, IDC_ST_STATUS, (g_lang == SETUP_LANG_RU) ? L"Распаковка компонентов..." : L"Extracting components...");
     UpdateWindow(hWnd);
 
@@ -370,36 +816,50 @@ static void DoInstallation(HWND hWnd) {
     WriteUninstallScript(installDir);
 
     if (!b1 || !b2) {
-        std::wstring err = (g_lang == SETUP_LANG_RU) ?
-            L"Ошибка при записи файлов программы. Убедитесь, что FileCommenter не запущен." :
-            L"Error writing application files. Make sure FileCommenter is not running.";
+        std::wstring err;
+        if (!IsProcessElevated()) {
+            err = (g_lang == SETUP_LANG_RU) ?
+                L"Ошибка записи файлов программы в «" + installDir + L"»!\n\n"
+                L"Причина: Отсутствуют права администратора. Windows заблокировала запись в системную папку Program Files.\n\n"
+                L"Решение: Запустите установочный файл правой кнопкой мыши -> «Запуск от имени администратора»." :
+                L"Error writing application files to '" + installDir + L"'!\n\n"
+                L"Reason: Missing administrator privileges. Windows blocked write access to Program Files.\n\n"
+                L"Solution: Run installer via right click -> 'Run as administrator'.";
+        } else {
+            err = (g_lang == SETUP_LANG_RU) ?
+                L"Ошибка при записи файлов программы. Убедитесь, что FileCommenter не заблокирован антивирусом или другими процессами." :
+                L"Error writing application files. Make sure FileCommenter is not locked by antivirus or another process.";
+        }
         MessageBoxW(hWnd, err.c_str(), L"Error", MB_ICONERROR);
         EnableWindow(GetDlgItem(hWnd, IDC_BTN_INSTALL), TRUE);
         EnableWindow(GetDlgItem(hWnd, IDC_BTN_CANCEL), TRUE);
+        EnableWindow(GetDlgItem(hWnd, IDC_BTN_BROWSE), TRUE);
+        EnableWindow(GetDlgItem(hWnd, IDC_EDT_PATH), TRUE);
         return;
     }
 
-    // 2. Регистрация Shell Extension DLL (FileCommentTip.dll)
+    // 2. Синхронная прямая регистрация Shell Extension DLL (FileCommentTip.dll)
     if (IsDlgButtonChecked(hWnd, IDC_CHK_SHELL_TIP) == BST_CHECKED) {
         SetDlgItemTextW(hWnd, IDC_ST_STATUS, (g_lang == SETUP_LANG_RU) ? L"Регистрация подсказок в Проводнике..." : L"Registering Explorer infotip shell extension...");
         UpdateWindow(hWnd);
 
-        std::wstring regCmd = L"/s \"" + tipDll + L"\"";
-        ShellExecuteW(NULL, L"open", L"regsvr32.exe", regCmd.c_str(), NULL, SW_HIDE);
+        RegisterShellExtensionDirect(tipDll);
     }
-    SendMessageW(hProgress, PBM_SETPOS, 75, 0);
+    SendMessageW(hProgress, PBM_SETPOS, 70, 0);
 
-    // 3. Добавление в контекстное меню Проводника
+    // 3. Синхронная прямая настройка контекстного меню (чистый UTF-16, без MUIVerb и кракозябр)
     if (IsDlgButtonChecked(hWnd, IDC_CHK_CTX_MENU) == BST_CHECKED) {
         SetDlgItemTextW(hWnd, IDC_ST_STATUS, (g_lang == SETUP_LANG_RU) ? L"Настройка контекстного меню Проводника..." : L"Configuring Explorer context menu...");
         UpdateWindow(hWnd);
 
-        SHELLEXECUTEINFOW sei = { sizeof(sei) };
-        sei.lpFile = editorExe.c_str();
-        sei.lpParameters = L"--install-context";
-        sei.nShow = SW_HIDE;
-        ShellExecuteExW(&sei);
+        PurgeAndRegisterContextMenuDirect(editorExe, g_lang);
     }
+    SendMessageW(hProgress, PBM_SETPOS, 80, 0);
+
+    // 3.1 Синхронизация ярлыков в «Недавние» и «Главная» для отображения заметок
+    SetDlgItemTextW(hWnd, IDC_ST_STATUS, (g_lang == SETUP_LANG_RU) ? L"Синхронизация подсказок в «Недавние» и «Главная»..." : L"Synchronizing tooltips in Recent & Home...");
+    UpdateWindow(hWnd);
+    SyncAllExistingShortcutsAndRecent();
     SendMessageW(hProgress, PBM_SETPOS, 85, 0);
 
     // 4. Создание ярлыков
@@ -623,9 +1083,33 @@ static LRESULT CALLBACK SetupWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
     return DefWindowProcW(hWnd, uMsg, wParam, lParam);
 }
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     g_hInstance = hInstance;
     g_lang = IsSystemRussian() ? SETUP_LANG_RU : SETUP_LANG_EN;
+
+    // Автоматическая проверка и повышение прав администратора при запуске
+    if (!IsProcessElevated()) {
+        // Запрашиваем повышение прав через системный диалог UAC
+        if (RelaunchElevated(NULL, lpCmdLine)) {
+            return 0; // Завершаем текущий непривилегированный процесс
+        }
+
+        // Если пользователь отказался в окне UAC
+        int choice = MessageBoxW(
+            NULL,
+            (g_lang == SETUP_LANG_RU)
+                ? L"Программе установки требуются права администратора для записи в системную папку «C:\\Program Files» и интеграции в Проводник Windows.\n\nЗапустить установку от имени администратора?"
+                : L"Setup requires administrator privileges to write into 'C:\\Program Files' and configure Windows Explorer.\n\nRun setup with administrator privileges?",
+            (g_lang == SETUP_LANG_RU) ? L"Требуются права администратора" : L"Administrator Privileges Required",
+            MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON1
+        );
+
+        if (choice == IDYES) {
+            if (RelaunchElevated(NULL, lpCmdLine)) {
+                return 0;
+            }
+        }
+    }
 
     CoInitialize(NULL);
     INITCOMMONCONTROLSEX icex = { sizeof(icex), ICC_WIN95_CLASSES | ICC_PROGRESS_CLASS };
